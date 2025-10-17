@@ -11,10 +11,12 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(cors());
 app.use(logger);
+// 静态资源目录
+app.use(express.static(path.join(__dirname, "build")));
 
 // 首页
 app.get("/", async (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+  res.sendFile(path.join(__dirname, "build/index.html"));
 });
 
 // 更新计数

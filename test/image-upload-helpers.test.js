@@ -12,6 +12,7 @@ const {
   createCorsOptions,
   getImageRateLimitPerHour,
   createImageRateLimiter,
+  resolveImageProvider,
   MAX_UPLOAD_IMAGES,
   MAX_UPLOAD_IMAGE_BYTES,
 } = require("../index");
@@ -296,4 +297,45 @@ test("frontend supports pasting image files into the prompt field", () => {
   assert.match(appSource, /handlePromptPaste/);
   assert.match(appSource, /clipboardData\.items/);
   assert.match(appSource, /getAsFile\(\)/);
+});
+
+test("resolveImageProvider selects default and IAI provider without exposing secrets", () => {
+  const originalOpenaiKey = process.env.OPENAI_API_KEY;
+  const originalOpenaiBaseUrl = process.env.OPENAI_BASE_URL;
+  const originalIaiKey = process.env.IAI_API_KEY;
+  const originalIaiBaseUrl = process.env.IAI_BASE_URL;
+
+  process.env.OPENAI_API_KEY = "default-key";
+  process.env.OPENAI_BASE_URL = "https://default.example.com/";
+  process.env.IAI_API_KEY = "iai-key";
+  process.env.IAI_BASE_URL = "https://iai.soyoung.com/";
+
+  try {
+    assert.deepStrictEqual(resolveImageProvider("iai"), {
+      id: "iai",
+      baseUrl: "https://iai.soyoung.com",
+      apiKey: "iai-key",
+      missingKeyEnv: "IAI_API_KEY",
+    });
+    assert.deepStrictEqual(resolveImageProvider("unknown"), {
+      id: "default",
+      baseUrl: "https://default.example.com",
+      apiKey: "default-key",
+      missingKeyEnv: "OPENAI_API_KEY",
+    });
+  } finally {
+    process.env.OPENAI_API_KEY = originalOpenaiKey;
+    process.env.OPENAI_BASE_URL = originalOpenaiBaseUrl;
+    process.env.IAI_API_KEY = originalIaiKey;
+    process.env.IAI_BASE_URL = originalIaiBaseUrl;
+  }
+});
+
+test("frontend exposes provider selector and submits provider id", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "../frontend/src/App.tsx"), "utf8");
+
+  assert.match(appSource, /const PROVIDER_OPTIONS = \[/);
+  assert.match(appSource, /value: "iai"/);
+  assert.match(appSource, /formData\.append\("provider", provider\)/);
+  assert.match(appSource, /htmlFor="provider"/);
 });

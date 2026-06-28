@@ -8,7 +8,6 @@ const multer = require("multer");
 const cors = require("cors");
 const morgan = require("morgan");
 const logger = morgan("tiny");
-const openaiBaseUrl = (process.env.OPENAI_BASE_URL || "https://vibe.soyoung.com").replace(/\/+$/, "");
 const imageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
 const responsesModel = process.env.OPENAI_RESPONSES_MODEL || process.env.OPENAI_MODEL || imageModel;
 const allowedImageSizes = new Set([
@@ -16,6 +15,7 @@ const allowedImageSizes = new Set([
   "1024x1024",
   "1024x1536",
   "1536x1024",
+  "1280x1024",
   "1920x1080",
   "3840x2160",
   "5760x3240",
@@ -28,6 +28,26 @@ const MAX_UPLOAD_IMAGE_BYTES = 10 * 1024 * 1024;
 const JSON_BODY_LIMIT = "60mb";
 const allowedUploadMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const imageDataUrlPattern = /^data:(image\/(png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
+
+function resolveImageProvider(value) {
+  const providerId = value === "iai" ? "iai" : "default";
+
+  if (providerId === "iai") {
+    return {
+      id: "iai",
+      baseUrl: (process.env.IAI_BASE_URL || "https://iai.soyoung.com").replace(/\/+$/, ""),
+      apiKey: process.env.IAI_API_KEY || "",
+      missingKeyEnv: "IAI_API_KEY",
+    };
+  }
+
+  return {
+    id: "default",
+    baseUrl: (process.env.OPENAI_BASE_URL || "https://vibe.soyoung.com").replace(/\/+$/, ""),
+    apiKey: process.env.OPENAI_API_KEY || "",
+    missingKeyEnv: "OPENAI_API_KEY",
+  };
+}
 
 function parseAllowedCorsOrigins(value) {
   return new Set(
@@ -130,8 +150,8 @@ const uploadImages = multer({
   limits: {
     files: MAX_UPLOAD_IMAGES,
     fileSize: MAX_UPLOAD_IMAGE_BYTES,
-    fields: 3,
-    parts: MAX_UPLOAD_IMAGES + 3,
+    fields: 4,
+    parts: MAX_UPLOAD_IMAGES + 4,
     fieldSize: 8 * 1024,
     fieldNameSize: 32,
   },
@@ -158,7 +178,7 @@ app.get("/", async (req, res) => {
   res.sendFile(path.join(__dirname, "build/index.html"));
 });
 
-function postJson(urlString, payload) {
+function postJson(urlString, payload, apiKey) {
   const url = new URL(urlString);
   const body = JSON.stringify(payload);
   const client = url.protocol === "http:" ? http : https;
@@ -169,7 +189,7 @@ function postJson(urlString, payload) {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(body),
         },
@@ -491,13 +511,13 @@ function createResponsesImagePayload(prompt, size, imageDataUrls, stream) {
   };
 }
 
-async function requestImageGeneration(prompt, size) {
-  const data = await postJson(`${openaiBaseUrl}/v1/images/generations`, {
+async function requestImageGeneration(prompt, size, provider) {
+  const data = await postJson(`${provider.baseUrl}/v1/images/generations`, {
     model: imageModel,
     prompt,
     size,
     n: 1,
-  });
+  }, provider.apiKey);
 
   return {
     api: "images",
@@ -505,9 +525,9 @@ async function requestImageGeneration(prompt, size) {
   };
 }
 
-async function requestResponsesImage(prompt, size, imageDataUrls) {
+async function requestResponsesImage(prompt, size, imageDataUrls, provider) {
   const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
-  const data = await postJson(`${openaiBaseUrl}/v1/responses`, createResponsesImagePayload(prompt, size, images, false));
+  const data = await postJson(`${provider.baseUrl}/v1/responses`, createResponsesImagePayload(prompt, size, images, false), provider.apiKey);
 
   return {
     api: images.length > 0 ? "responses_edit" : "responses",
@@ -515,12 +535,12 @@ async function requestResponsesImage(prompt, size, imageDataUrls) {
   };
 }
 
-async function generateImage(prompt, size) {
+async function generateImage(prompt, size, provider) {
   try {
-    return await requestImageGeneration(prompt, size);
+    return await requestImageGeneration(prompt, size, provider);
   } catch (imageError) {
     try {
-      return await requestResponsesImage(prompt, size, []);
+      return await requestResponsesImage(prompt, size, [], provider);
     } catch (responsesError) {
       responsesError.message = `${responsesError.message}；图片接口错误：${imageError.message}`;
       throw responsesError;
@@ -528,8 +548,8 @@ async function generateImage(prompt, size) {
   }
 }
 
-async function editImage(prompt, size, imageDataUrls) {
-  return requestResponsesImage(prompt, size, imageDataUrls);
+async function editImage(prompt, size, imageDataUrls, provider) {
+  return requestResponsesImage(prompt, size, imageDataUrls, provider);
 }
 
 function sendSseEvent(res, event, data) {
@@ -638,9 +658,9 @@ function processResponsesSseBlock(block, context) {
   }
 }
 
-function streamResponsesImage(prompt, size, imageDataUrls, res) {
+function streamResponsesImage(prompt, size, imageDataUrls, res, provider) {
   const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
-  const url = new URL(`${openaiBaseUrl}/v1/responses`);
+  const url = new URL(`${provider.baseUrl}/v1/responses`);
   const body = JSON.stringify(createResponsesImagePayload(prompt, size, images, true));
   const client = url.protocol === "http:" ? http : https;
   let upstreamRequest;
@@ -679,7 +699,7 @@ function streamResponsesImage(prompt, size, imageDataUrls, res) {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${provider.apiKey}`,
           Accept: "text/event-stream",
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(body),
@@ -773,6 +793,7 @@ app.post("/api/generate-image", imageRateLimiter, parseImageRequest, async (req,
   const prompt = typeof req.body.prompt === "string" ? req.body.prompt.trim() : "";
   const size = allowedImageSizes.has(req.body.size) ? req.body.size : "1024x1024";
   const mode = req.body.mode === "edit" ? "edit" : "generate";
+  const provider = resolveImageProvider(req.body.provider);
   let imageDataUrls = [];
 
   try {
@@ -785,10 +806,10 @@ app.post("/api/generate-image", imageRateLimiter, parseImageRequest, async (req,
     return;
   }
 
-  if (!process.env.OPENAI_API_KEY) {
+  if (!provider.apiKey) {
     res.status(500).send({
       code: 1,
-      message: "服务端缺少 OPENAI_API_KEY 环境变量",
+      message: `服务端缺少 ${provider.missingKeyEnv} 环境变量`,
     });
     return;
   }
@@ -818,7 +839,7 @@ app.post("/api/generate-image", imageRateLimiter, parseImageRequest, async (req,
   }
 
   try {
-    const result = mode === "edit" ? await editImage(prompt, size, imageDataUrls) : await generateImage(prompt, size);
+    const result = mode === "edit" ? await editImage(prompt, size, imageDataUrls, provider) : await generateImage(prompt, size, provider);
     const data = result.data;
     const image = normalizeImagePayload(data);
 
@@ -851,6 +872,7 @@ app.post("/api/generate-image-stream", imageRateLimiter, parseStreamImageRequest
   const prompt = typeof req.body.prompt === "string" ? req.body.prompt.trim() : "";
   const size = allowedImageSizes.has(req.body.size) ? req.body.size : "1024x1024";
   const mode = req.body.mode === "edit" ? "edit" : "generate";
+  const provider = resolveImageProvider(req.body.provider);
   let imageDataUrls = [];
   let heartbeatTimer;
 
@@ -875,9 +897,9 @@ app.post("/api/generate-image-stream", imageRateLimiter, parseStreamImageRequest
     "X-Accel-Buffering": "no",
   });
 
-  if (!process.env.OPENAI_API_KEY) {
+  if (!provider.apiKey) {
     sendSseEvent(res, "error", {
-      message: "服务端缺少 OPENAI_API_KEY 环境变量",
+      message: `服务端缺少 ${provider.missingKeyEnv} 环境变量`,
     });
     res.end();
     return;
@@ -910,7 +932,7 @@ app.post("/api/generate-image-stream", imageRateLimiter, parseStreamImageRequest
   heartbeatTimer = startSseHeartbeat(res);
 
   try {
-    await streamResponsesImage(prompt, size, mode === "edit" ? imageDataUrls : [], res);
+    await streamResponsesImage(prompt, size, mode === "edit" ? imageDataUrls : [], res, provider);
   } finally {
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
@@ -940,6 +962,7 @@ module.exports = {
   createCorsOptions,
   getImageRateLimitPerHour,
   createImageRateLimiter,
+  resolveImageProvider,
   isImageDataUrl,
   normalizeImagePayload,
   getImageDataUrlDecodedByteLength,

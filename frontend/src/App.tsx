@@ -25,6 +25,10 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const DEFAULT_IMAGE_SIZE = "auto";
 const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "1920x1080"];
+const PROVIDER_OPTIONS = [
+  { value: "default", label: "默认运营商" },
+  { value: "iai", label: "IAI" },
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -137,6 +141,7 @@ async function parseSseStream(
 export default function App() {
   const [prompt, setPrompt] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
+  const [provider, setProvider] = useState("default");
   const [size, setSize] = useState(DEFAULT_IMAGE_SIZE);
   const [validationMessage, setValidationMessage] = useState("");
   const [state, setState] = useState<GenerationState>("idle");
@@ -313,6 +318,7 @@ export default function App() {
 
     const formData = new FormData();
     formData.append("prompt", prompt);
+    formData.append("provider", provider);
     formData.append("mode", images.length > 0 ? "edit" : "generate");
     formData.append("size", size || DEFAULT_IMAGE_SIZE);
     if (images.length > 0) {
@@ -410,6 +416,17 @@ export default function App() {
             {IMAGE_SIZE_OPTIONS.map((option) => (
               <option value={option} key={option}>
                 {option}
+              </option>
+            ))}
+          </select>
+
+          <label className="field-label size-label" htmlFor="provider">
+            运营商
+          </label>
+          <select id="provider" value={provider} onChange={(event) => setProvider(event.target.value)} disabled={isGenerating}>
+            {PROVIDER_OPTIONS.map((option) => (
+              <option value={option.value} key={option.value}>
+                {option.label}
               </option>
             ))}
           </select>

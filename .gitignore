@@ -4,3 +4,4 @@ npm-debug.log*
 .superpowers/
 frontend/node_modules/
 frontend/dist/
+test/image-upload-helpers.test.js

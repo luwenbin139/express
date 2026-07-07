@@ -30,7 +30,7 @@ const allowedUploadMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]
 const imageDataUrlPattern = /^data:(image\/(png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
 
 function resolveImageProvider(value) {
-  const providerId = value === "iai" ? "iai" : "default";
+  const providerId = value === "default" ? "default" : "iai";
 
   if (providerId === "iai") {
     return {
@@ -177,59 +177,6 @@ app.use(express.static(path.join(__dirname, "build")));
 app.get("/", async (req, res) => {
   res.sendFile(path.join(__dirname, "build/index.html"));
 });
-
-function postJson(urlString, payload, apiKey) {
-  const url = new URL(urlString);
-  const body = JSON.stringify(payload);
-  const client = url.protocol === "http:" ? http : https;
-
-  return new Promise((resolve, reject) => {
-    const request = client.request(
-      url,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-        },
-      },
-      (response) => {
-        let rawBody = "";
-
-        response.setEncoding("utf8");
-        response.on("data", (chunk) => {
-          rawBody += chunk;
-        });
-        response.on("end", () => {
-          let data = {};
-
-          try {
-            data = rawBody ? JSON.parse(rawBody) : {};
-          } catch (error) {
-            reject(new Error("图片服务返回了无法解析的响应"));
-            return;
-          }
-
-          if (response.statusCode < 200 || response.statusCode >= 300) {
-            const message = data.error && data.error.message ? data.error.message : "图片生成请求失败";
-            reject(new Error(message));
-            return;
-          }
-
-          resolve(data);
-        });
-      }
-    );
-
-    request.setTimeout(120000, () => {
-      request.destroy(new Error("图片生成请求超时，请稍后重试"));
-    });
-    request.on("error", reject);
-    request.write(body);
-    request.end();
-  });
-}
 
 function isLikelyBase64Image(value) {
   return typeof value === "string" && value.length > 100 && /^[A-Za-z0-9+/=]+$/.test(value);
@@ -511,47 +458,6 @@ function createResponsesImagePayload(prompt, size, imageDataUrls, stream) {
   };
 }
 
-async function requestImageGeneration(prompt, size, provider) {
-  const data = await postJson(`${provider.baseUrl}/v1/images/generations`, {
-    model: imageModel,
-    prompt,
-    size,
-    n: 1,
-  }, provider.apiKey);
-
-  return {
-    api: "images",
-    data,
-  };
-}
-
-async function requestResponsesImage(prompt, size, imageDataUrls, provider) {
-  const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
-  const data = await postJson(`${provider.baseUrl}/v1/responses`, createResponsesImagePayload(prompt, size, images, false), provider.apiKey);
-
-  return {
-    api: images.length > 0 ? "responses_edit" : "responses",
-    data,
-  };
-}
-
-async function generateImage(prompt, size, provider) {
-  try {
-    return await requestImageGeneration(prompt, size, provider);
-  } catch (imageError) {
-    try {
-      return await requestResponsesImage(prompt, size, [], provider);
-    } catch (responsesError) {
-      responsesError.message = `${responsesError.message}；图片接口错误：${imageError.message}`;
-      throw responsesError;
-    }
-  }
-}
-
-async function editImage(prompt, size, imageDataUrls, provider) {
-  return requestResponsesImage(prompt, size, imageDataUrls, provider);
-}
-
 function sendSseEvent(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -787,86 +693,6 @@ function streamResponsesImage(prompt, size, imageDataUrls, res, provider) {
 }
 
 const imageRateLimiter = createImageRateLimiter();
-
-// 由服务端代理调用图片模型，避免在浏览器中暴露 API Key。
-app.post("/api/generate-image", imageRateLimiter, parseImageRequest, async (req, res) => {
-  const prompt = typeof req.body.prompt === "string" ? req.body.prompt.trim() : "";
-  const size = allowedImageSizes.has(req.body.size) ? req.body.size : "1024x1024";
-  const mode = req.body.mode === "edit" ? "edit" : "generate";
-  const provider = resolveImageProvider(req.body.provider);
-  let imageDataUrls = [];
-
-  try {
-    imageDataUrls = getRequestImageDataUrls(req);
-  } catch (error) {
-    res.status(400).send({
-      code: 1,
-      message: error.message,
-    });
-    return;
-  }
-
-  if (!provider.apiKey) {
-    res.status(500).send({
-      code: 1,
-      message: `服务端缺少 ${provider.missingKeyEnv} 环境变量`,
-    });
-    return;
-  }
-
-  if (!prompt) {
-    res.status(400).send({
-      code: 1,
-      message: "请输入图片提示词",
-    });
-    return;
-  }
-
-  if (prompt.length > 2000) {
-    res.status(400).send({
-      code: 1,
-      message: "提示词最多 2000 个字符",
-    });
-    return;
-  }
-
-  if (mode === "edit" && imageDataUrls.length === 0) {
-    res.status(400).send({
-      code: 1,
-      message: "图片编辑模式需要上传 PNG、JPG 或 WebP 原图",
-    });
-    return;
-  }
-
-  try {
-    const result = mode === "edit" ? await editImage(prompt, size, imageDataUrls, provider) : await generateImage(prompt, size, provider);
-    const data = result.data;
-    const image = normalizeImagePayload(data);
-
-    if (!image) {
-      res.status(502).send({
-        code: 1,
-        message: "图片服务未返回可展示的图片",
-      });
-      return;
-    }
-
-    res.send({
-      code: 0,
-      data: {
-        image,
-        model: imageModel,
-        responsesModel,
-        api: result.api,
-      },
-    });
-  } catch (error) {
-    res.status(502).send({
-      code: 1,
-      message: error.message || "图片生成失败",
-    });
-  }
-});
 
 app.post("/api/generate-image-stream", imageRateLimiter, parseStreamImageRequest, async (req, res) => {
   const prompt = typeof req.body.prompt === "string" ? req.body.prompt.trim() : "";

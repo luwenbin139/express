@@ -197,7 +197,7 @@ test("createImageRateLimiter returns JSON 429 for limited non-stream requests", 
   process.env.IMAGE_RATE_LIMIT_PER_HOUR = "1";
   const limiter = createImageRateLimiter();
   let nextCount = 0;
-  const req = { ip: "127.0.0.1", path: "/api/generate-image", connection: {} };
+  const req = { ip: "127.0.0.1", path: "/api/generate-image-stream", connection: {} };
   const res = {
     statusCode: 200,
     body: null,
@@ -317,11 +317,17 @@ test("resolveImageProvider selects default and IAI provider without exposing sec
       apiKey: "iai-key",
       missingKeyEnv: "IAI_API_KEY",
     });
-    assert.deepStrictEqual(resolveImageProvider("unknown"), {
+    assert.deepStrictEqual(resolveImageProvider("default"), {
       id: "default",
       baseUrl: "https://default.example.com",
       apiKey: "default-key",
       missingKeyEnv: "OPENAI_API_KEY",
+    });
+    assert.deepStrictEqual(resolveImageProvider("unknown"), {
+      id: "iai",
+      baseUrl: "https://iai.soyoung.com",
+      apiKey: "iai-key",
+      missingKeyEnv: "IAI_API_KEY",
     });
   } finally {
     process.env.OPENAI_API_KEY = originalOpenaiKey;
@@ -336,6 +342,7 @@ test("frontend exposes provider selector and submits provider id", () => {
 
   assert.match(appSource, /const PROVIDER_OPTIONS = \[/);
   assert.match(appSource, /value: "iai"/);
+  assert.match(appSource, /useState\("iai"\)/);
   assert.match(appSource, /formData\.append\("provider", provider\)/);
   assert.match(appSource, /htmlFor="provider"/);
 });

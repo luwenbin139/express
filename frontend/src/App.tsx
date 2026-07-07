@@ -26,8 +26,8 @@ const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const DEFAULT_IMAGE_SIZE = "auto";
 const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "1920x1080"];
 const PROVIDER_OPTIONS = [
-  { value: "default", label: "默认运营商" },
   { value: "iai", label: "IAI" },
+  { value: "default", label: "默认运营商" },
 ];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -141,7 +141,7 @@ async function parseSseStream(
 export default function App() {
   const [prompt, setPrompt] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
-  const [provider, setProvider] = useState("default");
+  const [provider, setProvider] = useState("iai");
   const [size, setSize] = useState(DEFAULT_IMAGE_SIZE);
   const [validationMessage, setValidationMessage] = useState("");
   const [state, setState] = useState<GenerationState>("idle");

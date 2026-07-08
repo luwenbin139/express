@@ -85,6 +85,17 @@ function getImageFromPayload(payload: unknown) {
   return null;
 }
 
+function createImageFormData(prompt: string, provider: string, size: string, images: ImageFile[]) {
+  const formData = new FormData();
+  formData.append("prompt", prompt);
+  formData.append("provider", provider);
+  formData.append("mode", images.length > 0 ? "edit" : "generate");
+  formData.append("size", size || DEFAULT_IMAGE_SIZE);
+  images.forEach((image) => formData.append("images", image.file));
+  return formData;
+}
+
+// 后端返回标准 SSE 文本流；这里按空行切块并还原 event/data。
 async function parseSseStream(
   response: Response,
   onMessage: (message: SseMessage) => void,
@@ -186,6 +197,7 @@ export default function App() {
     };
   }, []);
 
+  // 上传和粘贴最终都走这里，保证数量、格式和大小限制一致。
   const addImageFiles = (files: File[], source: "upload" | "paste") => {
     if (state === "generating") return;
     if (!files.length) return;
@@ -247,6 +259,7 @@ export default function App() {
     });
   };
 
+  // 后端只暴露少量事件，前端在这里集中更新状态和图片预览。
   const handleSseMessage = (message: SseMessage): SseMessageResult => {
     const payload = extractPayload(message.data);
 
@@ -301,6 +314,7 @@ export default function App() {
     setStatus("已取消当前请求。你可以修改提示词或图片后重新开始。");
   };
 
+  // 只调用流式接口；生成/编辑由是否上传参考图自动决定。
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -316,14 +330,7 @@ export default function App() {
     setHeartbeatAt(null);
     setStatus("正在上传 multipart/form-data 到 /api/generate-image-stream…");
 
-    const formData = new FormData();
-    formData.append("prompt", prompt);
-    formData.append("provider", provider);
-    formData.append("mode", images.length > 0 ? "edit" : "generate");
-    formData.append("size", size || DEFAULT_IMAGE_SIZE);
-    if (images.length > 0) {
-      images.forEach((image) => formData.append("images", image.file));
-    }
+    const formData = createImageFormData(prompt, provider, size, images);
 
     try {
       const response = await fetch(API_ENDPOINT, {

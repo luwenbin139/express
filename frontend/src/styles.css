@@ -81,6 +81,11 @@ h1 {
   align-items: start;
 }
 
+.left-stack {
+  display: grid;
+  gap: 26px;
+}
+
 .panel {
   position: relative;
   overflow: hidden;
@@ -100,6 +105,7 @@ h1 {
 }
 
 .config-panel,
+.transparent-panel,
 .result-panel {
   padding: clamp(22px, 3vw, 34px);
 }
@@ -267,11 +273,33 @@ select {
   background: rgba(255, 250, 241, 0.7);
 }
 
-.preview-card img {
+.preview-open-button {
+  width: 74px;
+  height: 74px;
+  padding: 0;
+  border-radius: 15px;
+  cursor: zoom-in;
+  background: transparent;
+}
+
+.preview-open-button img {
+  display: block;
   width: 74px;
   height: 74px;
   border-radius: 15px;
   object-fit: cover;
+  transition: filter 160ms ease, transform 160ms ease;
+}
+
+.preview-open-button:hover img,
+.preview-open-button:focus-visible img {
+  filter: brightness(1.08);
+  transform: scale(1.03);
+}
+
+.preview-open-button:focus-visible {
+  outline: 3px solid rgba(255, 200, 87, 0.86);
+  outline-offset: 3px;
 }
 
 .preview-card strong,
@@ -288,23 +316,28 @@ select {
   font-size: 0.9rem;
 }
 
-.preview-card button,
+.remove-image-button,
+.download-button,
 .secondary-button {
+  display: inline-block;
   padding: 10px 13px;
   border-radius: 999px;
   color: var(--ink);
   cursor: pointer;
   background: rgba(34, 26, 22, 0.08);
   font-weight: 900;
+  text-decoration: none;
   transition: transform 160ms ease, background 160ms ease;
 }
 
-.preview-card button:disabled {
+.remove-image-button:disabled {
   cursor: not-allowed;
   opacity: 0.54;
 }
 
-.preview-card button:hover:not(:disabled),
+.remove-image-button:hover:not(:disabled),
+.download-button:hover,
+.download-button:focus-visible,
 .secondary-button:hover:not(:disabled) {
   transform: translateY(-1px);
   background: rgba(34, 26, 22, 0.14);
@@ -336,6 +369,72 @@ select {
 .primary-button:disabled {
   cursor: not-allowed;
   opacity: 0.58;
+}
+
+.transparent-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.transparent-preview-card {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: rgba(255, 250, 241, 0.62);
+}
+
+.transparent-preview-card > span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.transparent-preview-card button {
+  display: grid;
+  width: 100%;
+  aspect-ratio: 16 / 7;
+  min-height: 92px;
+  place-items: center;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  cursor: zoom-in;
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, rgba(34, 26, 22, 0.08) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(34, 26, 22, 0.08) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(34, 26, 22, 0.08) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(34, 26, 22, 0.08) 75%);
+  background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+  background-size: 24px 24px;
+}
+
+.transparent-preview-card img {
+  display: block;
+  max-width: 100%;
+  max-height: 150px;
+  object-fit: contain;
+}
+
+.transparent-preview-card strong,
+.transparent-preview-card small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transparent-preview-card small {
+  color: var(--muted);
+  font-weight: 800;
 }
 
 .status-card {
@@ -463,6 +562,30 @@ select {
   object-fit: contain;
 }
 
+.image-open-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border-radius: 22px;
+  cursor: zoom-in;
+  background: transparent;
+}
+
+.image-open-button img {
+  transition: filter 160ms ease, transform 160ms ease;
+}
+
+.image-open-button:hover img,
+.image-open-button:focus-visible img {
+  filter: brightness(1.08);
+  transform: scale(1.005);
+}
+
+.image-open-button:focus-visible {
+  outline: 3px solid rgba(255, 200, 87, 0.86);
+  outline-offset: 4px;
+}
+
 .image-stage > span {
   position: absolute;
   top: 22px;
@@ -473,6 +596,37 @@ select {
   color: #fffaf1;
   background: rgba(0, 0, 0, 0.54);
   opacity: 1;
+}
+
+.refine-form {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.refine-form .field-label {
+  margin-bottom: 0;
+}
+
+.refine-form textarea {
+  min-height: 104px;
+  resize: vertical;
+}
+
+.refine-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.refinement-message {
+  margin: 0;
+  color: var(--muted);
+  font-weight: 800;
+  line-height: 1.45;
 }
 
 .empty-state {
@@ -500,6 +654,58 @@ select {
   margin: 10px 0 0;
   color: var(--muted);
   line-height: 1.5;
+}
+
+.result-lightbox {
+  --lightbox-padding: clamp(18px, 4vw, 48px);
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: var(--lightbox-padding);
+  overflow: auto;
+  cursor: zoom-out;
+  background: rgba(12, 9, 8, 0.88);
+}
+
+.result-lightbox img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: calc(100vw - var(--lightbox-padding) * 2);
+  max-height: calc(100vh - var(--lightbox-padding) * 2);
+  border-radius: 18px;
+  cursor: default;
+  object-fit: contain;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.5);
+}
+
+@supports (height: 100dvh) {
+  .result-lightbox img {
+    max-height: calc(100dvh - var(--lightbox-padding) * 2);
+  }
+}
+
+.result-lightbox-close {
+  position: fixed;
+  top: clamp(14px, 3vw, 28px);
+  right: clamp(14px, 3vw, 28px);
+  z-index: 21;
+  padding: 11px 15px;
+  border-radius: 999px;
+  color: #fffaf1;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.14);
+  font-weight: 900;
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.result-lightbox-close:hover,
+.result-lightbox-close:focus-visible {
+  background: rgba(255, 255, 255, 0.24);
+  transform: translateY(-1px);
 }
 
 @keyframes pulse {
@@ -553,12 +759,13 @@ select {
     grid-template-columns: 64px minmax(0, 1fr);
   }
 
-  .preview-card button {
+  .remove-image-button {
     grid-column: 1 / -1;
   }
 
   .status-card,
-  .meta-grid {
+  .meta-grid,
+  .transparent-preview-grid {
     grid-template-columns: 1fr;
   }
 

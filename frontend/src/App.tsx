@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, FormEvent } from "react";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { jsPDF } from "jspdf";
+import JSZip from "jszip";
 
 type ImageFile = {
   id: string;
@@ -30,12 +34,45 @@ type TransparentPreview = {
   size?: number;
 };
 
+type CompressedImageResult = {
+  blob: Blob;
+  reachedTarget: boolean;
+};
+
+type PdfImageOutput = {
+  name: string;
+  downloadUrl: string;
+  previewUrl: string;
+  size: number;
+  pageCount: number;
+  isArchive: boolean;
+};
+
+type PdfOutput = {
+  name: string;
+  downloadUrl: string;
+  size: number;
+  pageCount: number;
+};
+
 const API_ENDPOINT = "/api/generate-image-stream";
-const MAX_IMAGES = 4;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_TOOL_FILE_SIZE = 50 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const PDF_MIME_TYPE = "application/pdf";
 const DEFAULT_IMAGE_SIZE = "auto";
 const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "1920x1080"];
+const COMPRESSION_TARGETS = [
+  { label: "1 MB", value: 1 * 1024 * 1024 },
+  { label: "5 MB", value: 5 * 1024 * 1024 },
+  { label: "10 MB", value: 10 * 1024 * 1024 },
+  { label: "100 MB", value: 100 * 1024 * 1024 },
+];
+const MAX_COMPRESSION_DIMENSION = 4096;
+const PDF_RENDER_SCALE = 2;
+const PDF_RENDER_MAX_DIMENSION = 4096;
+
+GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -151,6 +188,29 @@ function createTransparentFileName(fileName: string) {
   return `${baseName}-transparent.png`;
 }
 
+function createCompressedFileName(fileName: string, mimeType: string) {
+  const dotIndex = fileName.lastIndexOf(".");
+  const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+  return `${baseName}-compressed.${getImageFileExtension(mimeType)}`;
+}
+
+function getFileBaseName(fileName: string) {
+  const dotIndex = fileName.lastIndexOf(".");
+  return dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+}
+
+function createPdfPageImageName(fileName: string, pageNumber: number) {
+  return `${getFileBaseName(fileName)}-page-${pageNumber}.png`;
+}
+
+function createImagesPdfFileName(files: File[]) {
+  return files.length === 1 ? `${getFileBaseName(files[0].name)}.pdf` : "images-to-pdf.pdf";
+}
+
+function isPdfFile(file: File) {
+  return file.type === PDF_MIME_TYPE || file.name.toLowerCase().endsWith(".pdf");
+}
+
 function loadImageElement(file: File) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -168,7 +228,7 @@ function loadImageElement(file: File) {
   });
 }
 
-function canvasToPngBlob(canvas: HTMLCanvasElement) {
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number) {
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) {
@@ -176,8 +236,8 @@ function canvasToPngBlob(canvas: HTMLCanvasElement) {
         return;
       }
 
-      reject(new Error("透明 PNG 导出失败，请换一张图片重试。"));
-    }, "image/png");
+      reject(new Error("图片导出失败，请换一张图片重试。"));
+    }, type, quality);
   });
 }
 
@@ -226,7 +286,159 @@ async function createTransparentPngBlob(file: File) {
   applyTransparentMatte(imageData);
   context.putImageData(imageData, 0, 0);
 
-  return canvasToPngBlob(canvas);
+  return canvasToBlob(canvas, "image/png");
+}
+
+function getCompressionMimeType(file: File) {
+  return file.type === "image/png" ? "image/png" : file.type === "image/webp" ? "image/webp" : "image/jpeg";
+}
+
+async function createCompressedImageBlob(file: File, targetBytes: number): Promise<CompressedImageResult> {
+  const image = await loadImageElement(file);
+  const outputType = getCompressionMimeType(file);
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("当前浏览器不支持图片压缩。");
+  }
+
+  const initialScale = Math.min(1, MAX_COMPRESSION_DIMENSION / Math.max(image.naturalWidth, image.naturalHeight));
+  let width = Math.max(1, Math.round(image.naturalWidth * initialScale));
+  let height = Math.max(1, Math.round(image.naturalHeight * initialScale));
+  let quality = 0.92;
+  let smallestBlob: Blob | null = null;
+
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    canvas.width = width;
+    canvas.height = height;
+    context.clearRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+
+    const blob = await canvasToBlob(canvas, outputType, outputType === "image/png" ? undefined : quality);
+    if (!smallestBlob || blob.size < smallestBlob.size) smallestBlob = blob;
+    if (blob.size <= targetBytes) return { blob, reachedTarget: true };
+
+    if (outputType !== "image/png" && quality > 0.5) {
+      quality = Math.max(0.5, quality - 0.08);
+      continue;
+    }
+
+    const targetScale = Math.max(0.58, Math.min(0.86, Math.sqrt(targetBytes / blob.size) * 0.94));
+    const minimumScale = Math.min(1, 320 / Math.max(width, height));
+    const scale = Math.max(minimumScale, targetScale);
+    const nextWidth = Math.max(1, Math.round(width * scale));
+    const nextHeight = Math.max(1, Math.round(height * scale));
+
+    if (nextWidth === width && nextHeight === height) break;
+    width = nextWidth;
+    height = nextHeight;
+    quality = 0.92;
+  }
+
+  if (!smallestBlob) throw new Error("图片压缩失败，请换一张图片重试。");
+  return { blob: smallestBlob, reachedTarget: false };
+}
+
+async function createPdfImageOutput(file: File, onProgress: (pageNumber: number, pageCount: number) => void): Promise<PdfImageOutput> {
+  const loadingTask = getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const pdfDocument = await loadingTask.promise;
+  const pageCount = pdfDocument.numPages;
+  const zip = new JSZip();
+  let firstPageBlob: Blob | null = null;
+
+  try {
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+      onProgress(pageNumber, pageCount);
+      const page = await pdfDocument.getPage(pageNumber);
+      const initialViewport = page.getViewport({ scale: PDF_RENDER_SCALE });
+      const scale = Math.min(1, PDF_RENDER_MAX_DIMENSION / Math.max(initialViewport.width, initialViewport.height));
+      const viewport = page.getViewport({ scale: PDF_RENDER_SCALE * scale });
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+
+      if (!context) throw new Error("当前浏览器不支持 PDF 页面渲染。");
+
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      await page.render({ canvas, canvasContext: context, viewport }).promise;
+      const pageBlob = await canvasToBlob(canvas, "image/png");
+      if (!firstPageBlob) firstPageBlob = pageBlob;
+      zip.file(createPdfPageImageName(file.name, pageNumber), pageBlob);
+      canvas.width = 1;
+      canvas.height = 1;
+      page.cleanup();
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+
+  if (!firstPageBlob) throw new Error("PDF 中没有可转换的页面。");
+
+  const previewUrl = URL.createObjectURL(firstPageBlob);
+  if (pageCount === 1) {
+    return {
+      name: createPdfPageImageName(file.name, 1),
+      downloadUrl: previewUrl,
+      previewUrl,
+      size: firstPageBlob.size,
+      pageCount: 1,
+      isArchive: false,
+    };
+  }
+
+  const archiveBlob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+  return {
+    name: `${getFileBaseName(file.name)}-images.zip`,
+    downloadUrl: URL.createObjectURL(archiveBlob),
+    previewUrl,
+    size: archiveBlob.size,
+    pageCount,
+    isArchive: true,
+  };
+}
+
+async function createPdfFromImages(files: File[]) {
+  const firstImage = await loadImageElement(files[0]);
+  const pdf = new jsPDF({
+    unit: "pt",
+    format: "a4",
+    orientation: firstImage.naturalWidth > firstImage.naturalHeight ? "landscape" : "portrait",
+    compress: true,
+  });
+
+  for (let index = 0; index < files.length; index += 1) {
+    const image = index === 0 ? firstImage : await loadImageElement(files[index]);
+    const imageScale = Math.min(1, MAX_COMPRESSION_DIMENSION / Math.max(image.naturalWidth, image.naturalHeight));
+    const width = Math.max(1, Math.round(image.naturalWidth * imageScale));
+    const height = Math.max(1, Math.round(image.naturalHeight * imageScale));
+    const orientation = width > height ? "landscape" : "portrait";
+
+    if (index > 0) pdf.addPage("a4", orientation);
+    if (index === 0) pdf.setPage(1);
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 36;
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("当前浏览器不支持图片转 PDF。");
+
+    canvas.width = width;
+    canvas.height = height;
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+    const drawScale = Math.min((pageWidth - margin * 2) / width, (pageHeight - margin * 2) / height);
+    const drawWidth = width * drawScale;
+    const drawHeight = height * drawScale;
+    pdf.addImage(dataUrl, "JPEG", (pageWidth - drawWidth) / 2, (pageHeight - drawHeight) / 2, drawWidth, drawHeight, undefined, "FAST");
+    canvas.width = 1;
+    canvas.height = 1;
+  }
+
+  return pdf.output("blob");
 }
 
 // 后端返回标准 SSE 文本流；这里按空行切块并还原 event/data。
@@ -300,12 +512,33 @@ export default function App() {
   const [transparentOutput, setTransparentOutput] = useState<TransparentPreview | null>(null);
   const [transparentMessage, setTransparentMessage] = useState("");
   const [isTransparencyProcessing, setIsTransparencyProcessing] = useState(false);
+  const [compressionSource, setCompressionSource] = useState<TransparentPreview | null>(null);
+  const [compressionOutput, setCompressionOutput] = useState<TransparentPreview | null>(null);
+  const [compressionMessage, setCompressionMessage] = useState("");
+  const [compressionTarget, setCompressionTarget] = useState(COMPRESSION_TARGETS[3].value);
+  const [isCompressionProcessing, setIsCompressionProcessing] = useState(false);
+  const [pdfSource, setPdfSource] = useState<TransparentPreview | null>(null);
+  const [pdfImageOutput, setPdfImageOutput] = useState<PdfImageOutput | null>(null);
+  const [pdfToImageMessage, setPdfToImageMessage] = useState("");
+  const [isPdfConverting, setIsPdfConverting] = useState(false);
+  const [pdfImages, setPdfImages] = useState<ImageFile[]>([]);
+  const [imagePdfOutput, setImagePdfOutput] = useState<PdfOutput | null>(null);
+  const [imageToPdfMessage, setImageToPdfMessage] = useState("");
+  const [isImagePdfProcessing, setIsImagePdfProcessing] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [elapsed, setElapsed] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const imagesRef = useRef<ImageFile[]>([]);
+  const pdfImagesRef = useRef<ImageFile[]>([]);
   const transparentSourceUrlRef = useRef<string | null>(null);
   const transparentOutputUrlRef = useRef<string | null>(null);
+  const compressionFileRef = useRef<File | null>(null);
+  const compressionSourceUrlRef = useRef<string | null>(null);
+  const compressionOutputUrlRef = useRef<string | null>(null);
+  const pdfSourceUrlRef = useRef<string | null>(null);
+  const pdfImagePreviewUrlRef = useRef<string | null>(null);
+  const pdfImageDownloadUrlRef = useRef<string | null>(null);
+  const imagePdfOutputUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (state !== "generating") return undefined;
@@ -331,6 +564,10 @@ export default function App() {
   useEffect(() => {
     imagesRef.current = images;
   }, [images]);
+
+  useEffect(() => {
+    pdfImagesRef.current = pdfImages;
+  }, [pdfImages]);
 
   useEffect(() => {
     if (!lightboxImage) return undefined;
@@ -360,6 +597,13 @@ export default function App() {
       imagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl));
       if (transparentSourceUrlRef.current) URL.revokeObjectURL(transparentSourceUrlRef.current);
       if (transparentOutputUrlRef.current) URL.revokeObjectURL(transparentOutputUrlRef.current);
+      if (compressionSourceUrlRef.current) URL.revokeObjectURL(compressionSourceUrlRef.current);
+      if (compressionOutputUrlRef.current) URL.revokeObjectURL(compressionOutputUrlRef.current);
+      if (pdfSourceUrlRef.current) URL.revokeObjectURL(pdfSourceUrlRef.current);
+      if (pdfImagePreviewUrlRef.current) URL.revokeObjectURL(pdfImagePreviewUrlRef.current);
+      if (pdfImageDownloadUrlRef.current && pdfImageDownloadUrlRef.current !== pdfImagePreviewUrlRef.current) URL.revokeObjectURL(pdfImageDownloadUrlRef.current);
+      if (imagePdfOutputUrlRef.current) URL.revokeObjectURL(imagePdfOutputUrlRef.current);
+      pdfImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl));
       abortRef.current?.abort();
     };
   }, []);
@@ -371,13 +615,8 @@ export default function App() {
 
     const nextImages: ImageFile[] = [];
     const messages: string[] = [];
-    const remainingSlots = MAX_IMAGES - images.length;
 
-    if (files.length > remainingSlots) {
-      messages.push(`最多只能上传 ${MAX_IMAGES} 张图片，已忽略多出的文件。`);
-    }
-
-    files.slice(0, Math.max(remainingSlots, 0)).forEach((file) => {
+    files.forEach((file) => {
       if (!ALLOWED_TYPES.has(file.type)) {
         messages.push(`${file.name} 不是支持的 png/jpeg/webp 格式。`);
         return;
@@ -481,6 +720,178 @@ export default function App() {
     });
     setTransparentOutput(null);
     void convertTransparentImage(file);
+  };
+
+  const compressImage = async (file: File, targetBytes: number) => {
+    setIsCompressionProcessing(true);
+    setCompressionMessage(`正在本地压缩到 ${formatBytes(targetBytes)} 以内…`);
+
+    try {
+      const { blob, reachedTarget } = await createCompressedImageBlob(file, targetBytes);
+      const outputUrl = URL.createObjectURL(blob);
+
+      if (compressionOutputUrlRef.current) URL.revokeObjectURL(compressionOutputUrlRef.current);
+      compressionOutputUrlRef.current = outputUrl;
+      setCompressionOutput({
+        name: createCompressedFileName(file.name, blob.type || getCompressionMimeType(file)),
+        previewUrl: outputUrl,
+        size: blob.size,
+      });
+      setCompressionMessage(
+        reachedTarget
+          ? `已压缩至 ${formatBytes(blob.size)}，可以预览或下载。`
+          : `已尽量压缩至 ${formatBytes(blob.size)}，仍未达到 ${formatBytes(targetBytes)}。`,
+      );
+    } catch (error) {
+      if (compressionOutputUrlRef.current) URL.revokeObjectURL(compressionOutputUrlRef.current);
+      compressionOutputUrlRef.current = null;
+      setCompressionOutput(null);
+      setCompressionMessage(error instanceof Error ? error.message : "图片压缩失败。");
+    } finally {
+      setIsCompressionProcessing(false);
+    }
+  };
+
+  const handleCompressionFile = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+
+    if (!file) return;
+
+    if (!ALLOWED_TYPES.has(file.type)) {
+      setCompressionMessage(`${file.name} 不是支持的 png/jpeg/webp 格式。`);
+      return;
+    }
+
+    if (file.size > MAX_TOOL_FILE_SIZE) {
+      setCompressionMessage(`${file.name} 超过 ${formatBytes(MAX_TOOL_FILE_SIZE)}。`);
+      return;
+    }
+
+    const sourceUrl = URL.createObjectURL(file);
+    if (compressionSourceUrlRef.current) URL.revokeObjectURL(compressionSourceUrlRef.current);
+    if (compressionOutputUrlRef.current) URL.revokeObjectURL(compressionOutputUrlRef.current);
+
+    compressionFileRef.current = file;
+    compressionSourceUrlRef.current = sourceUrl;
+    compressionOutputUrlRef.current = null;
+    setCompressionSource({ name: file.name, previewUrl: sourceUrl, size: file.size });
+    setCompressionOutput(null);
+    void compressImage(file, compressionTarget);
+  };
+
+  const handleCompressionTargetChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const targetBytes = Number(event.target.value);
+    setCompressionTarget(targetBytes);
+    if (compressionFileRef.current) void compressImage(compressionFileRef.current, targetBytes);
+  };
+
+  const convertPdfToImages = async (file: File) => {
+    setIsPdfConverting(true);
+    setPdfToImageMessage("正在读取 PDF 页面…");
+
+    try {
+      const output = await createPdfImageOutput(file, (pageNumber, pageCount) => {
+        setPdfToImageMessage(`正在转换第 ${pageNumber}/${pageCount} 页…`);
+      });
+      pdfImagePreviewUrlRef.current = output.previewUrl;
+      pdfImageDownloadUrlRef.current = output.downloadUrl;
+      setPdfImageOutput(output);
+      setPdfToImageMessage(output.isArchive ? `已转换 ${output.pageCount} 页，已打包为 ZIP。` : "已转换为 PNG，可以预览或下载。");
+    } catch (error) {
+      setPdfImageOutput(null);
+      setPdfToImageMessage(error instanceof Error ? error.message : "PDF 转图片失败。");
+    } finally {
+      setIsPdfConverting(false);
+    }
+  };
+
+  const handlePdfFile = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+    if (!file) return;
+
+    if (!isPdfFile(file)) {
+      setPdfToImageMessage(`${file.name} 不是 PDF 文件。`);
+      return;
+    }
+    if (file.size > MAX_TOOL_FILE_SIZE) {
+      setPdfToImageMessage(`${file.name} 超过 ${formatBytes(MAX_TOOL_FILE_SIZE)}。`);
+      return;
+    }
+
+    if (pdfSourceUrlRef.current) URL.revokeObjectURL(pdfSourceUrlRef.current);
+    if (pdfImagePreviewUrlRef.current) URL.revokeObjectURL(pdfImagePreviewUrlRef.current);
+    if (pdfImageDownloadUrlRef.current && pdfImageDownloadUrlRef.current !== pdfImagePreviewUrlRef.current) URL.revokeObjectURL(pdfImageDownloadUrlRef.current);
+    pdfSourceUrlRef.current = URL.createObjectURL(file);
+    pdfImagePreviewUrlRef.current = null;
+    pdfImageDownloadUrlRef.current = null;
+    setPdfSource({ name: file.name, previewUrl: pdfSourceUrlRef.current, size: file.size });
+    setPdfImageOutput(null);
+    void convertPdfToImages(file);
+  };
+
+  const addPdfImageFiles = (files: File[]) => {
+    const accepted: ImageFile[] = [];
+    const messages: string[] = [];
+
+    files.forEach((file) => {
+      if (!ALLOWED_TYPES.has(file.type)) {
+        messages.push(`${file.name} 不是支持的 png/jpeg/webp 格式。`);
+        return;
+      }
+      if (file.size > MAX_TOOL_FILE_SIZE) {
+        messages.push(`${file.name} 超过 ${formatBytes(MAX_TOOL_FILE_SIZE)}。`);
+        return;
+      }
+      accepted.push({
+        id: `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`,
+        file,
+        previewUrl: URL.createObjectURL(file),
+      });
+    });
+
+    setPdfImages((current) => [...current, ...accepted]);
+    setImageToPdfMessage(messages.join(" "));
+  };
+
+  const handlePdfImages = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    addPdfImageFiles(files);
+  };
+
+  const removePdfImage = (id: string) => {
+    setPdfImages((current) => {
+      const image = current.find((item) => item.id === id);
+      if (image) URL.revokeObjectURL(image.previewUrl);
+      return current.filter((item) => item.id !== id);
+    });
+  };
+
+  const convertImagesToPdf = async () => {
+    if (!pdfImages.length) return;
+
+    setIsImagePdfProcessing(true);
+    setImageToPdfMessage(`正在生成包含 ${pdfImages.length} 页的 PDF…`);
+    try {
+      const outputBlob = await createPdfFromImages(pdfImages.map((image) => image.file));
+      const outputUrl = URL.createObjectURL(outputBlob);
+      if (imagePdfOutputUrlRef.current) URL.revokeObjectURL(imagePdfOutputUrlRef.current);
+      imagePdfOutputUrlRef.current = outputUrl;
+      setImagePdfOutput({
+        name: createImagesPdfFileName(pdfImages.map((image) => image.file)),
+        downloadUrl: outputUrl,
+        size: outputBlob.size,
+        pageCount: pdfImages.length,
+      });
+      setImageToPdfMessage("PDF 已生成，可以下载。");
+    } catch (error) {
+      setImagePdfOutput(null);
+      setImageToPdfMessage(error instanceof Error ? error.message : "图片转 PDF 失败。");
+    } finally {
+      setIsImagePdfProcessing(false);
+    }
   };
 
   // 后端只暴露少量事件，前端在这里集中更新状态和图片预览。
@@ -650,7 +1061,7 @@ export default function App() {
     }
   };
 
-  const canSubmit = state !== "generating" && images.length <= MAX_IMAGES;
+  const canSubmit = state !== "generating";
   const isGenerating = state === "generating";
   const visibleResult = finalImage ?? partialImage;
   const canRefine = Boolean(finalImage && refinementPrompt.trim()) && !isGenerating;
@@ -664,7 +1075,7 @@ export default function App() {
               <span>01</span>
               <div>
                 <h2>配置输入</h2>
-                <p>最多 4 张参考图，每张不超过 10MB。</p>
+                <p>参考图每张不超过 10MB。</p>
               </div>
             </div>
 
@@ -695,7 +1106,7 @@ export default function App() {
             <label className={`upload-zone ${isGenerating ? "is-disabled" : ""}`} htmlFor="images">
               <input id="images" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleFiles} disabled={isGenerating} />
               <span>可选：上传或粘贴参考图</span>
-              <strong>不上传也能直接生成 · {MAX_IMAGES - images.length} 个名额可用</strong>
+              <strong>不上传也能直接生成 · 可多选参考图</strong>
             </label>
             {validationMessage && <p className="validation-message" aria-live="polite">{validationMessage}</p>}
 
@@ -780,6 +1191,165 @@ export default function App() {
                   </article>
                 )}
               </div>
+            )}
+          </section>
+
+          <section className="panel compressor-panel">
+            <div className="panel-heading">
+              <span>04</span>
+              <div>
+                <h2>图片压缩</h2>
+                <p>压缩至指定大小，图片只在浏览器本地处理。</p>
+              </div>
+            </div>
+
+            <label className="field-label" htmlFor="compression-target">
+              目标文件大小
+            </label>
+            <select id="compression-target" value={compressionTarget} onChange={handleCompressionTargetChange} disabled={isCompressionProcessing}>
+              {COMPRESSION_TARGETS.map((target) => (
+                <option value={target.value} key={target.value}>
+                  {target.label} 以内
+                </option>
+              ))}
+            </select>
+
+            <label className={`upload-zone ${isCompressionProcessing ? "is-disabled" : ""}`} htmlFor="compression-image">
+              <input id="compression-image" type="file" accept="image/png,image/jpeg,image/webp" onChange={handleCompressionFile} disabled={isCompressionProcessing} />
+              <span>选择要压缩的图片</span>
+              <strong>支持 PNG、JPG、WebP，单张不超过 50MB。</strong>
+            </label>
+
+            {compressionMessage && (
+              <p className="validation-message" aria-live="polite">
+                {compressionMessage}
+              </p>
+            )}
+
+            {(compressionSource || compressionOutput) && (
+              <div className="transparent-preview-grid">
+                {compressionSource && (
+                  <article className="transparent-preview-card">
+                    <span>原图</span>
+                    <button type="button" onClick={() => setLightboxImage({ src: compressionSource.previewUrl, alt: compressionSource.name })} aria-label={`放大查看 ${compressionSource.name}`}>
+                      <img src={compressionSource.previewUrl} alt={`${compressionSource.name} 原图`} />
+                    </button>
+                    <strong title={compressionSource.name}>{compressionSource.name}</strong>
+                    {compressionSource.size && <small>{formatBytes(compressionSource.size)}</small>}
+                  </article>
+                )}
+
+                {compressionOutput && (
+                  <article className="transparent-preview-card">
+                    <span>压缩结果</span>
+                    <button type="button" onClick={() => setLightboxImage({ src: compressionOutput.previewUrl, alt: compressionOutput.name })} aria-label={`放大查看 ${compressionOutput.name}`}>
+                      <img src={compressionOutput.previewUrl} alt={`${compressionOutput.name} 压缩结果`} />
+                    </button>
+                    <strong title={compressionOutput.name}>{compressionOutput.name}</strong>
+                    {compressionOutput.size && <small>{formatBytes(compressionOutput.size)}</small>}
+                    <a className="download-button" href={compressionOutput.previewUrl} download={compressionOutput.name}>
+                      下载图片
+                    </a>
+                  </article>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="panel document-tool-panel">
+            <div className="panel-heading">
+              <span>05</span>
+              <div>
+                <h2>PDF 转图片</h2>
+                <p>逐页转为 PNG，多页文件会自动打包。</p>
+              </div>
+            </div>
+
+            <label className={`upload-zone ${isPdfConverting ? "is-disabled" : ""}`} htmlFor="pdf-to-images">
+              <input id="pdf-to-images" type="file" accept="application/pdf,.pdf" onChange={handlePdfFile} disabled={isPdfConverting} />
+              <span>选择要转换的 PDF</span>
+              <strong>单个文件不超过 50MB，仅在浏览器本地处理。</strong>
+            </label>
+
+            {pdfToImageMessage && <p className="validation-message" aria-live="polite">{pdfToImageMessage}</p>}
+
+            {(pdfSource || pdfImageOutput) && (
+              <div className="document-output-grid">
+                {pdfSource && (
+                  <article className="document-output-card">
+                    <span>源文件</span>
+                    <strong title={pdfSource.name}>{pdfSource.name}</strong>
+                    {pdfSource.size && <small>{formatBytes(pdfSource.size)}</small>}
+                  </article>
+                )}
+                {pdfImageOutput && (
+                  <article className="document-output-card">
+                    <span>{pdfImageOutput.isArchive ? "图片压缩包" : "PNG 图片"}</span>
+                    <button type="button" onClick={() => setLightboxImage({ src: pdfImageOutput.previewUrl, alt: `${pdfSource?.name ?? "PDF"} 第 1 页` })} aria-label="放大查看 PDF 第一页">
+                      <img src={pdfImageOutput.previewUrl} alt="PDF 第一页预览" />
+                    </button>
+                    <strong title={pdfImageOutput.name}>{pdfImageOutput.name}</strong>
+                    <small>{pdfImageOutput.pageCount} 页 · {formatBytes(pdfImageOutput.size)}</small>
+                    <a className="download-button" href={pdfImageOutput.downloadUrl} download={pdfImageOutput.name}>
+                      下载{pdfImageOutput.isArchive ? " ZIP" : " PNG"}
+                    </a>
+                  </article>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="panel document-tool-panel">
+            <div className="panel-heading">
+              <span>06</span>
+              <div>
+                <h2>图片转 PDF</h2>
+                <p>按上传顺序，每张图片生成一页自适应方向的 A4。</p>
+              </div>
+            </div>
+
+            <label className={`upload-zone ${isImagePdfProcessing ? "is-disabled" : ""}`} htmlFor="images-to-pdf">
+              <input id="images-to-pdf" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handlePdfImages} disabled={isImagePdfProcessing} />
+              <span>选择要合并的图片</span>
+              <strong>支持 PNG、JPG、WebP，单张不超过 50MB。</strong>
+            </label>
+
+            {imageToPdfMessage && <p className="validation-message" aria-live="polite">{imageToPdfMessage}</p>}
+
+            {pdfImages.length > 0 && (
+              <div className="preview-grid document-image-grid">
+                {pdfImages.map((image, index) => (
+                  <article className="preview-card" key={image.id}>
+                    <button className="preview-open-button" type="button" onClick={() => setLightboxImage({ src: image.previewUrl, alt: image.file.name })} aria-label={`放大查看 ${image.file.name}`}>
+                      <img src={image.previewUrl} alt={`${image.file.name} PDF 第 ${index + 1} 页`} />
+                    </button>
+                    <div>
+                      <strong title={image.file.name}>第 {index + 1} 页 · {image.file.name}</strong>
+                      <span>{formatBytes(image.file.size)}</span>
+                    </div>
+                    <button className="remove-image-button" type="button" onClick={() => removePdfImage(image.id)} disabled={isImagePdfProcessing}>
+                      移除
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+
+            <div className="form-actions">
+              <button className="primary-button" type="button" onClick={convertImagesToPdf} disabled={isImagePdfProcessing || pdfImages.length === 0}>
+                {isImagePdfProcessing ? "生成 PDF 中…" : "生成 PDF"}
+              </button>
+            </div>
+
+            {imagePdfOutput && (
+              <article className="document-output-card document-output-download">
+                <span>PDF 文件</span>
+                <strong title={imagePdfOutput.name}>{imagePdfOutput.name}</strong>
+                <small>{imagePdfOutput.pageCount} 页 · {formatBytes(imagePdfOutput.size)}</small>
+                <a className="download-button" href={imagePdfOutput.downloadUrl} download={imagePdfOutput.name}>
+                  下载 PDF
+                </a>
+              </article>
             )}
           </section>
         </div>

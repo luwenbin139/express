@@ -845,22 +845,72 @@ select {
   background: rgba(12, 9, 8, 0.88);
 }
 
-.result-lightbox img {
+.result-lightbox-image {
   display: block;
   width: auto;
   height: auto;
   max-width: calc(100vw - var(--lightbox-padding) * 2);
   max-height: calc(100vh - var(--lightbox-padding) * 2);
   border-radius: 8px;
-  cursor: default;
+  cursor: zoom-in;
   object-fit: contain;
   box-shadow: 0 28px 90px rgba(0, 0, 0, 0.5);
+  touch-action: none;
+  transform: translate3d(var(--lightbox-pan-x, 0), var(--lightbox-pan-y, 0), 0) scale(var(--lightbox-zoom, 1));
+  transform-origin: center;
+  transition: transform 140ms ease;
+}
+
+.result-lightbox-image.is-zoomed {
+  cursor: grab;
+}
+
+.result-lightbox-image.is-zoomed:active {
+  cursor: grabbing;
 }
 
 @supports (height: 100dvh) {
-  .result-lightbox img {
+  .result-lightbox-image {
     max-height: calc(100dvh - var(--lightbox-padding) * 2);
   }
+}
+
+.result-lightbox-controls {
+  position: fixed;
+  top: clamp(14px, 3vw, 28px);
+  left: clamp(14px, 3vw, 28px);
+  z-index: 21;
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  border-radius: 8px;
+  background: rgba(18, 21, 19, 0.76);
+}
+
+.result-lightbox-controls button {
+  min-width: 42px;
+  height: 42px;
+  padding: 0 12px;
+  border-right: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+  cursor: pointer;
+  background: transparent;
+  font-weight: 900;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+.result-lightbox-controls button:last-child {
+  border-right: 0;
+}
+
+.result-lightbox-controls button:hover:not(:disabled),
+.result-lightbox-controls button:focus-visible {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.result-lightbox-controls button:disabled {
+  cursor: not-allowed;
+  color: rgba(255, 255, 255, 0.42);
 }
 
 .result-lightbox-close {

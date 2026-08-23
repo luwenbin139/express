@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, ClipboardEvent, FormEvent } from "react";
+import type { ChangeEvent, ClipboardEvent, CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
@@ -73,6 +73,9 @@ const COMPRESSION_TARGETS = [
 const MAX_COMPRESSION_DIMENSION = 4096;
 const PDF_RENDER_SCALE = 2;
 const PDF_RENDER_MAX_DIMENSION = 4096;
+const LIGHTBOX_MIN_ZOOM = 1;
+const LIGHTBOX_MAX_ZOOM = 4;
+const LIGHTBOX_ZOOM_STEP = 0.25;
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -89,6 +92,10 @@ function formatElapsed(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return `${minutes}:${remainder.toString().padStart(2, "0")}`;
+}
+
+function clampLightboxZoom(value: number) {
+  return Math.min(LIGHTBOX_MAX_ZOOM, Math.max(LIGHTBOX_MIN_ZOOM, Math.round(value * 100) / 100));
 }
 
 function normalizeImageSource(value: unknown): string | null {
@@ -511,6 +518,8 @@ export default function App() {
   const [partialImage, setPartialImage] = useState<string | null>(null);
   const [finalImage, setFinalImage] = useState<string | null>(null);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
+  const [lightboxZoom, setLightboxZoom] = useState(LIGHTBOX_MIN_ZOOM);
+  const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
   const [transparentSource, setTransparentSource] = useState<TransparentPreview | null>(null);
   const [transparentOutput, setTransparentOutput] = useState<TransparentPreview | null>(null);
   const [transparentMessage, setTransparentMessage] = useState("");
@@ -542,6 +551,9 @@ export default function App() {
   const pdfImagePreviewUrlRef = useRef<string | null>(null);
   const pdfImageDownloadUrlRef = useRef<string | null>(null);
   const imagePdfOutputUrlRef = useRef<string | null>(null);
+  const lightboxPointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const lightboxPinchRef = useRef<{ distance: number; zoom: number } | null>(null);
+  const lightboxPanRef = useRef<{ x: number; y: number; pan: { x: number; y: number } } | null>(null);
 
   useEffect(() => {
     if (state !== "generating") return undefined;
@@ -576,12 +588,44 @@ export default function App() {
     if (!lightboxImage) return undefined;
 
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setLightboxImage(null);
+      if (event.key === "Escape") {
+        setLightboxImage(null);
+        return;
+      }
+
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        setLightboxZoom((current) => clampLightboxZoom(current + LIGHTBOX_ZOOM_STEP));
+      }
+
+      if (event.key === "-") {
+        event.preventDefault();
+        setLightboxZoom((current) => clampLightboxZoom(current - LIGHTBOX_ZOOM_STEP));
+      }
+
+      if (event.key === "0") {
+        event.preventDefault();
+        setLightboxZoom(LIGHTBOX_MIN_ZOOM);
+      }
     };
 
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [lightboxImage]);
+
+  useEffect(() => {
+    setLightboxZoom(LIGHTBOX_MIN_ZOOM);
+    setLightboxPan({ x: 0, y: 0 });
+    lightboxPointersRef.current.clear();
+    lightboxPinchRef.current = null;
+    lightboxPanRef.current = null;
+  }, [lightboxImage?.src]);
+
+  useEffect(() => {
+    if (lightboxZoom === LIGHTBOX_MIN_ZOOM) {
+      setLightboxPan({ x: 0, y: 0 });
+    }
+  }, [lightboxZoom]);
 
   useEffect(() => {
     if (finalImage) return;
@@ -1069,6 +1113,65 @@ export default function App() {
   const visibleResult = finalImage ?? partialImage;
   const canRefine = Boolean(finalImage && refinementPrompt.trim()) && !isGenerating;
   const isToolsPage = location.pathname === "/tools";
+  const adjustLightboxZoom = (amount: number) => {
+    setLightboxZoom((current) => clampLightboxZoom(current + amount));
+  };
+  const getPointerDistance = (pointers: { x: number; y: number }[]) => {
+    const [first, second] = pointers;
+    return Math.hypot(second.x - first.x, second.y - first.y);
+  };
+  const handleLightboxPointerDown = (event: ReactPointerEvent<HTMLImageElement>) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    lightboxPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const pointers = [...lightboxPointersRef.current.values()];
+
+    if (pointers.length === 2) {
+      lightboxPanRef.current = null;
+      lightboxPinchRef.current = { distance: getPointerDistance(pointers), zoom: lightboxZoom };
+      return;
+    }
+
+    if (pointers.length === 1 && lightboxZoom > LIGHTBOX_MIN_ZOOM) {
+      lightboxPanRef.current = { x: event.clientX, y: event.clientY, pan: lightboxPan };
+    }
+  };
+  const handleLightboxPointerMove = (event: ReactPointerEvent<HTMLImageElement>) => {
+    if (!lightboxPointersRef.current.has(event.pointerId)) return;
+    lightboxPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const pointers = [...lightboxPointersRef.current.values()];
+
+    if (pointers.length === 2 && lightboxPinchRef.current) {
+      event.preventDefault();
+      const distance = getPointerDistance(pointers);
+      setLightboxZoom(clampLightboxZoom(lightboxPinchRef.current.zoom * (distance / lightboxPinchRef.current.distance)));
+      return;
+    }
+
+    if (pointers.length !== 1 || !lightboxPanRef.current) return;
+    event.preventDefault();
+    setLightboxPan({
+      x: lightboxPanRef.current.pan.x + event.clientX - lightboxPanRef.current.x,
+      y: lightboxPanRef.current.pan.y + event.clientY - lightboxPanRef.current.y,
+    });
+  };
+  const handleLightboxPointerEnd = (event: ReactPointerEvent<HTMLImageElement>) => {
+    lightboxPointersRef.current.delete(event.pointerId);
+    const pointers = [...lightboxPointersRef.current.values()];
+    lightboxPinchRef.current = null;
+
+    if (pointers.length === 1 && lightboxZoom > LIGHTBOX_MIN_ZOOM) {
+      const [pointer] = pointers;
+      lightboxPanRef.current = { x: pointer.x, y: pointer.y, pan: lightboxPan };
+      return;
+    }
+
+    lightboxPanRef.current = null;
+  };
+  const handleLightboxWheel = (event: ReactWheelEvent<HTMLImageElement>) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    adjustLightboxZoom(event.deltaY < 0 ? LIGHTBOX_ZOOM_STEP : -LIGHTBOX_ZOOM_STEP);
+  };
 
   return (
     <main className={`app-shell ${isToolsPage ? "page-tools" : "page-generator"}`}>
@@ -1473,10 +1576,32 @@ export default function App() {
       </div>
       {lightboxImage && (
         <div className="result-lightbox" role="dialog" aria-modal="true" aria-label={`${lightboxImage.alt}预览`} onClick={() => setLightboxImage(null)}>
+          <div className="result-lightbox-controls" role="group" aria-label="图片缩放">
+            <button type="button" onClick={(event) => { event.stopPropagation(); adjustLightboxZoom(-LIGHTBOX_ZOOM_STEP); }} disabled={lightboxZoom <= LIGHTBOX_MIN_ZOOM} aria-label="缩小图片" title="缩小图片">
+              -
+            </button>
+            <button type="button" onClick={(event) => { event.stopPropagation(); setLightboxZoom(LIGHTBOX_MIN_ZOOM); setLightboxPan({ x: 0, y: 0 }); }} disabled={lightboxZoom === LIGHTBOX_MIN_ZOOM && lightboxPan.x === 0 && lightboxPan.y === 0} aria-label="重置缩放" title="重置缩放">
+              {Math.round(lightboxZoom * 100)}%
+            </button>
+            <button type="button" onClick={(event) => { event.stopPropagation(); adjustLightboxZoom(LIGHTBOX_ZOOM_STEP); }} disabled={lightboxZoom >= LIGHTBOX_MAX_ZOOM} aria-label="放大图片" title="放大图片">
+              +
+            </button>
+          </div>
           <button className="result-lightbox-close" type="button" onClick={() => setLightboxImage(null)} aria-label="关闭图片预览">
             关闭
           </button>
-          <img src={lightboxImage.src} alt={lightboxImage.alt} onClick={(event) => event.stopPropagation()} />
+          <img
+            className={`result-lightbox-image ${lightboxZoom > LIGHTBOX_MIN_ZOOM ? "is-zoomed" : ""}`}
+            src={lightboxImage.src}
+            alt={lightboxImage.alt}
+            style={{ "--lightbox-zoom": lightboxZoom, "--lightbox-pan-x": `${lightboxPan.x}px`, "--lightbox-pan-y": `${lightboxPan.y}px` } as CSSProperties}
+            onClick={(event) => event.stopPropagation()}
+            onPointerDown={handleLightboxPointerDown}
+            onPointerMove={handleLightboxPointerMove}
+            onPointerUp={handleLightboxPointerEnd}
+            onPointerCancel={handleLightboxPointerEnd}
+            onWheel={handleLightboxWheel}
+          />
         </div>
       )}
     </main>

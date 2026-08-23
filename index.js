@@ -172,7 +172,7 @@ app.use(logger);
 app.use(express.static(path.join(__dirname, "build")));
 
 // 首页
-app.get("/", async (req, res) => {
+app.get(["/", "/generator", "/tools"], async (req, res) => {
   res.sendFile(path.join(__dirname, "build/index.html"));
 });
 

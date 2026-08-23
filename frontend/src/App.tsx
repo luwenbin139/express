@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, FormEvent } from "react";
+import { NavLink, useLocation } from "react-router-dom";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { jsPDF } from "jspdf";
@@ -56,7 +57,8 @@ type PdfOutput = {
 };
 
 const API_ENDPOINT = "/api/generate-image-stream";
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_REFERENCE_FILE_SIZE = 20 * 1024 * 1024;
+const MAX_TRANSPARENT_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_TOOL_FILE_SIZE = 50 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const PDF_MIME_TYPE = "application/pdf";
@@ -496,6 +498,7 @@ async function parseSseStream(
 }
 
 export default function App() {
+  const location = useLocation();
   const [prompt, setPrompt] = useState("");
   const [refinementPrompt, setRefinementPrompt] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
@@ -621,8 +624,8 @@ export default function App() {
         messages.push(`${file.name} 不是支持的 png/jpeg/webp 格式。`);
         return;
       }
-      if (file.size > MAX_FILE_SIZE) {
-        messages.push(`${file.name} 超过 10MB。`);
+      if (file.size > MAX_REFERENCE_FILE_SIZE) {
+        messages.push(`${file.name} 超过 20MB。`);
         return;
       }
       nextImages.push({
@@ -702,7 +705,7 @@ export default function App() {
       return;
     }
 
-    if (file.size > MAX_FILE_SIZE) {
+    if (file.size > MAX_TRANSPARENT_FILE_SIZE) {
       setTransparentMessage(`${file.name} 超过 10MB。`);
       return;
     }
@@ -1065,9 +1068,24 @@ export default function App() {
   const isGenerating = state === "generating";
   const visibleResult = finalImage ?? partialImage;
   const canRefine = Boolean(finalImage && refinementPrompt.trim()) && !isGenerating;
+  const isToolsPage = location.pathname === "/tools";
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${isToolsPage ? "page-tools" : "page-generator"}`}>
+      <header className="app-topbar">
+        <NavLink className="app-brand" to="/generator" aria-label="前往图片生成">
+          <span className="app-brand-mark" aria-hidden="true" />
+          <strong>AI Image Studio</strong>
+        </NavLink>
+        <nav className="app-nav" aria-label="主导航">
+          <NavLink className={({ isActive }) => `app-nav-link ${isActive || location.pathname === "/" ? "is-active" : ""}`} to="/generator">
+            图片生成
+          </NavLink>
+          <NavLink className={({ isActive }) => `app-nav-link ${isActive ? "is-active" : ""}`} to="/tools">
+            图片工具
+          </NavLink>
+        </nav>
+      </header>
       <div className="workspace">
         <div className="left-stack">
           <form className="panel config-panel" onSubmit={submit}>
@@ -1075,7 +1093,7 @@ export default function App() {
               <span>01</span>
               <div>
                 <h2>配置输入</h2>
-                <p>参考图每张不超过 10MB。</p>
+                <p>参考图每张不超过 20MB。</p>
               </div>
             </div>
 
@@ -1144,6 +1162,7 @@ export default function App() {
             </div>
           </form>
 
+          <div className="toolkit" aria-label="本地图片与 PDF 工具">
           <section className="panel transparent-panel">
             <div className="panel-heading">
               <span>03</span>
@@ -1352,6 +1371,7 @@ export default function App() {
               </article>
             )}
           </section>
+          </div>
         </div>
 
         <section className="panel result-panel">
@@ -1384,9 +1404,11 @@ export default function App() {
             </div>
           </div>
 
-          <p className="persistence-note">
-            关闭或刷新页面会中断当前任务；前端目前没有后端持久化恢复能力，请等待 final_image 或 done 后再离开。
-          </p>
+          {isGenerating && (
+            <p className="persistence-note">
+              关闭或刷新页面会中断当前任务；请等待 final_image 或 done 后再离开。
+            </p>
+          )}
 
           {errorMessage && (
             <div className="error-box" role="alert">

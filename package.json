@@ -1,7 +1,7 @@
 {
-  "name": "wxcloudrun-express",
+  "name": "ai-image-studio",
   "version": "1.0.0",
-  "description": "微信云托管 express 框架模版",
+  "description": "AI 图片生成与编辑工作台，提供 React/Vite 前端与 Responses 图片生成流代理接口",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

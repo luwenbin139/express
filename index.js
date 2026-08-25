@@ -23,26 +23,14 @@ const allowedImageSizes = new Set([
   "2160x3840",
   "3240x5760",
 ]);
-const MAX_UPLOAD_IMAGES = 4;
-const MAX_UPLOAD_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_UPLOAD_IMAGES = Number.parseInt(process.env.MAX_UPLOAD_IMAGES || "0", 10);
+const MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
 const JSON_BODY_LIMIT = "60mb";
 const allowedUploadMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const imageDataUrlPattern = /^data:(image\/(png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
 const IMAGE_STREAM_ROUTE = "/api/generate-image-stream";
 
-// 默认走 IAI；保留 default provider 只是为了手动切回旧通道排障。
-function resolveImageProvider(value) {
-  const providerId = value === "default" ? "default" : "iai";
-
-  if (providerId === "iai") {
-    return {
-      id: "iai",
-      baseUrl: (process.env.IAI_BASE_URL || "https://iai.soyoung.com").replace(/\/+$/, ""),
-      apiKey: process.env.IAI_API_KEY || "",
-      missingKeyEnv: "IAI_API_KEY",
-    };
-  }
-
+function resolveImageProvider() {
   return {
     id: "default",
     baseUrl: (process.env.OPENAI_BASE_URL || "https://vibe.soyoung.com").replace(/\/+$/, ""),
@@ -146,10 +134,9 @@ function createImageRateLimiter() {
 const uploadImages = multer({
   storage: multer.memoryStorage(),
   limits: {
-    files: MAX_UPLOAD_IMAGES,
+    ...(hasUploadImageLimit() ? { files: MAX_UPLOAD_IMAGES, parts: MAX_UPLOAD_IMAGES + 4 } : {}),
     fileSize: MAX_UPLOAD_IMAGE_BYTES,
     fields: 4,
-    parts: MAX_UPLOAD_IMAGES + 4,
     fieldSize: 8 * 1024,
     fieldNameSize: 32,
   },
@@ -162,6 +149,14 @@ const uploadImages = multer({
     callback(null, true);
   },
 });
+
+function hasUploadImageLimit() {
+  return Number.isFinite(MAX_UPLOAD_IMAGES) && MAX_UPLOAD_IMAGES > 0;
+}
+
+function getUploadImageLimitMessage() {
+  return `最多上传 ${MAX_UPLOAD_IMAGES} 张图片`;
+}
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -275,8 +270,8 @@ function collectJsonImageDataUrls(body) {
 
 // 除了 MIME，还检查图片头，避免把伪装成图片的任意 base64 传给上游服务。
 function validateImageDataUrls(imageDataUrls) {
-  if (imageDataUrls.length > MAX_UPLOAD_IMAGES) {
-    throw new Error(`最多上传 ${MAX_UPLOAD_IMAGES} 张图片`);
+  if (hasUploadImageLimit() && imageDataUrls.length > MAX_UPLOAD_IMAGES) {
+    throw new Error(getUploadImageLimitMessage());
   }
 
   for (const imageDataUrl of imageDataUrls) {
@@ -285,7 +280,7 @@ function validateImageDataUrls(imageDataUrls) {
     }
 
     if (getImageDataUrlDecodedByteLength(imageDataUrl) > MAX_UPLOAD_IMAGE_BYTES) {
-      throw new Error("单张图片最大 10MB");
+      throw new Error("单张图片最大 20MB");
     }
 
     const parsedImageDataUrl = parseImageDataUrl(imageDataUrl);
@@ -301,8 +296,8 @@ function validateImageDataUrls(imageDataUrls) {
 function convertUploadedFilesToDataUrls(files) {
   const uploadedFiles = Array.isArray(files) ? files : [];
 
-  if (uploadedFiles.length > MAX_UPLOAD_IMAGES) {
-    throw new Error(`最多上传 ${MAX_UPLOAD_IMAGES} 张图片`);
+  if (hasUploadImageLimit() && uploadedFiles.length > MAX_UPLOAD_IMAGES) {
+    throw new Error(getUploadImageLimitMessage());
   }
 
   return uploadedFiles.map((file) => {
@@ -314,7 +309,7 @@ function convertUploadedFilesToDataUrls(files) {
     const size = typeof file.size === "number" ? file.size : buffer.length;
 
     if (size > MAX_UPLOAD_IMAGE_BYTES || buffer.length > MAX_UPLOAD_IMAGE_BYTES) {
-      throw new Error("单张图片最大 10MB");
+      throw new Error("单张图片最大 20MB");
     }
 
     if (!isImageMagicValid(file.mimetype, buffer)) {
@@ -359,8 +354,8 @@ function isMultipartRequest(req) {
 function getMulterErrorMessage(error) {
   if (error && error.code) {
     const messages = {
-      LIMIT_FILE_SIZE: "单张图片最大 10MB",
-      LIMIT_FILE_COUNT: `最多上传 ${MAX_UPLOAD_IMAGES} 张图片`,
+      LIMIT_FILE_SIZE: "单张图片最大 20MB",
+      LIMIT_FILE_COUNT: hasUploadImageLimit() ? getUploadImageLimitMessage() : "上传图片数量过多",
       LIMIT_FIELD_COUNT: "上传字段过多",
       LIMIT_FIELD_VALUE: "上传字段内容过长",
       LIMIT_PART_COUNT: "上传内容过多",
@@ -368,7 +363,7 @@ function getMulterErrorMessage(error) {
     };
 
     if (error.code === "LIMIT_UNEXPECTED_FILE") {
-      return error.field && error.field !== "images" ? "请使用 images 字段上传图片" : `最多上传 ${MAX_UPLOAD_IMAGES} 张图片`;
+      return error.field && error.field !== "images" ? "请使用 images 字段上传图片" : hasUploadImageLimit() ? getUploadImageLimitMessage() : "上传图片数量过多";
     }
 
     if (messages[error.code]) {
@@ -385,7 +380,9 @@ function parseMultipartImageRequest(req, res, next, onError) {
     return;
   }
 
-  uploadImages.array("images", MAX_UPLOAD_IMAGES)(req, res, (error) => {
+  const parseImages = hasUploadImageLimit() ? uploadImages.array("images", MAX_UPLOAD_IMAGES) : uploadImages.array("images");
+
+  parseImages(req, res, (error) => {
     if (error) {
       onError(getMulterErrorMessage(error));
       return;
@@ -454,6 +451,7 @@ function createResponsesImagePayload(prompt, size, imageDataUrls, stream) {
     tools: [
       {
         type: "image_generation",
+        model: imageModel,
         size,
       },
     ],
@@ -533,6 +531,8 @@ function getStreamImageApiName(context) {
 function getStreamImageMetadata(context) {
   return {
     model: imageModel,
+    imageToolModel: imageModel,
+    responseModel: responsesModel,
     responsesModel,
     api: getStreamImageApiName(context),
   };
@@ -594,10 +594,18 @@ function sendFinalImageIfFound(context, payload) {
   return true;
 }
 
+function markResponsesStreamComplete(context) {
+  context.completed = true;
+}
+
 // 把上游 Responses SSE 翻译成前端只关心的 status/partial_image/final_image/done/error。
 function processResponsesSseBlock(block, context) {
   const parsed = parseSseBlock(block.trim());
   if (!parsed.data || parsed.data === "[DONE]") {
+    return;
+  }
+
+  if (context.completed) {
     return;
   }
 
@@ -634,7 +642,13 @@ function processResponsesSseBlock(block, context) {
   }
 
   if (data.type === "response.output_item.done" && isPlainObject(data.item)) {
-    sendFinalImageIfFound(context, data.item);
+    if (sendFinalImageIfFound(context, data.item)) {
+      sendSseEventIfWritable(context.res, "done", {
+        image: context.finalImage,
+        ...getStreamImageMetadata(context),
+      });
+      markResponsesStreamComplete(context);
+    }
     return;
   }
 
@@ -658,6 +672,7 @@ function processResponsesSseBlock(block, context) {
       image: context.finalImage,
       ...getStreamImageMetadata(context),
     });
+    markResponsesStreamComplete(context);
   }
 }
 
@@ -707,16 +722,30 @@ function handleGoodUpstreamStream(upstreamResponse, context, state, sendStreamEr
     message: "已连接图片生成流，正在等待模型返回...",
   });
 
+  const finishIfCompleted = () => {
+    if (!context.completed) {
+      return;
+    }
+
+    upstreamResponse.destroy();
+    resolveOnce();
+  };
+
   upstreamResponse.on("error", (error) => {
-    sendStreamError(error.message || "图片生成流响应失败");
+    if (!context.completed) {
+      sendStreamError(error.message || "图片生成流响应失败");
+    }
     resolveOnce();
   });
   upstreamResponse.on("aborted", () => {
-    sendStreamError("图片生成流响应已中断");
+    if (!context.completed) {
+      sendStreamError("图片生成流响应已中断");
+    }
     resolveOnce();
   });
   upstreamResponse.on("data", (chunk) => {
     processResponsesSseChunk(chunk, state, context);
+    finishIfCompleted();
   });
   upstreamResponse.on("end", () => {
     flushResponsesSseBuffer(state, context);
@@ -733,6 +762,7 @@ function streamResponsesImage(prompt, size, imageDataUrls, res, provider) {
   let upstreamRequest;
   const sseState = { buffer: "" };
   const sseContext = {
+    completed: false,
     finalImage: "",
     images,
     res,
@@ -812,7 +842,7 @@ function getImageStreamRequest(req, imageDataUrls) {
     imageDataUrls,
     mode: req.body.mode === "edit" ? "edit" : "generate",
     prompt: typeof req.body.prompt === "string" ? req.body.prompt.trim() : "",
-    provider: resolveImageProvider(req.body.provider),
+    provider: resolveImageProvider(),
     size: allowedImageSizes.has(req.body.size) ? req.body.size : "1024x1024",
   };
 }

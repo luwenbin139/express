@@ -1,122 +1,82 @@
-# wxcloudrun-express
+# AI Image Studio
 
-[![GitHub license](https://img.shields.io/github/license/WeixinCloud/wxcloudrun-express)](https://github.com/WeixinCloud/wxcloudrun-express)
-![GitHub package.json dependency version (prod)](https://img.shields.io/github/package-json/dependency-version/WeixinCloud/wxcloudrun-express/express)
-![GitHub package.json dependency version (prod)](https://img.shields.io/github/package-json/dependency-version/WeixinCloud/wxcloudrun-express/sequelize)
+一个图片生成、追图编辑和本地图片处理工作台。前端使用 React/Vite，Express 后端将生成请求代理到兼容 OpenAI Responses API 的图片服务。
 
-微信云托管 Node.js Express 框架模版，实现简单的计数器读写接口，使用云托管 MySQL 读写、记录计数值。
+## 功能
 
-![](https://qcloudimg.tencent-cloud.cn/raw/be22992d297d1b9a1a5365e606276781.png)
+- 文生图与参考图编辑，支持 PNG、JPG、WebP 参考图和 SSE 流式状态
+- 基于当前生成结果追加提示词继续修改
+- 最终图下载、复制，并可直接送入透明 PNG、压缩、图片转 PDF
+- 本地生成历史：浏览器 IndexedDB 保存最近 12 条结果，支持恢复和删除
+- 浏览器本地工具：透明 PNG、图片压缩、PDF 转图片、图片转 PDF
+- 最终图、参考图和工具结果支持放大、缩放和拖动查看
 
-## 快速开始
+## 本地启动
 
-前往 [微信云托管快速开始页面](https://cloud.weixin.qq.com/cloudrun/onekey)，选择相应语言的模板，根据引导完成部署。
+需要 Node.js 20.19 或更高版本。
 
-## 本地调试
-下载代码在本地调试，请参考[微信云托管本地调试指南](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/guide/debug/)
-
-## 实时开发
-代码变动时，不需要重新构建和启动容器，即可查看变动后的效果。请参考[微信云托管实时开发指南](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/guide/debug/dev.html)
-
-## Dockerfile最佳实践
-请参考[如何提高项目构建效率](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/scene/build/speed.html)
-
-## 项目结构说明
-
-```
-.
-├── Dockerfile
-├── README.md
-├── container.config.json
-├── db.js
-├── index.js
-├── index.html
-├── package.json
+```bash
+npm install
+npm run frontend:install
+npm run frontend:build
+OPENAI_API_KEY=your_key npm start
 ```
 
-- `index.js`：项目入口，实现主要的读写 API
-- `db.js`：数据库相关实现，使用 `sequelize` 作为 ORM
-- `index.html`：首页代码
-- `package.json`：Node.js 项目定义文件
-- `container.config.json`：模板部署「服务设置」初始化配置（二开请忽略）
-- `Dockerfile`：容器配置文件
+服务默认监听 `80` 端口。开发前端时可单独启动：
 
-## 服务 API 文档
-
-### `GET /api/count`
-
-获取当前计数
-
-#### 请求参数
-
-无
-
-#### 响应结果
-
-- `code`：错误码
-- `data`：当前计数值
-
-##### 响应结果示例
-
-```json
-{
-  "code": 0,
-  "data": 42
-}
+```bash
+npm run dev --prefix frontend
 ```
 
-#### 调用示例
+生产环境由 Express 提供根目录的 `build/` 静态文件，因此修改前端后需要执行：
 
-```
-curl https://<云托管服务域名>/api/count
-```
-
-### `POST /api/count`
-
-更新计数，自增或者清零
-
-#### 请求参数
-
-- `action`：`string` 类型，枚举值
-  - 等于 `"inc"` 时，表示计数加一
-  - 等于 `"clear"` 时，表示计数重置（清零）
-
-##### 请求参数示例
-
-```
-{
-  "action": "inc"
-}
+```bash
+npm run frontend:build
 ```
 
-#### 响应结果
+## 配置
 
-- `code`：错误码
-- `data`：当前计数值
+把密钥放在本地环境变量或未提交的 `.env` 文件中，不要写入源码或构建产物。
 
-##### 响应结果示例
+| 环境变量 | 说明 | 默认值 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | 图片服务 API 密钥，必填 | 无 |
+| `OPENAI_BASE_URL` | OpenAI 兼容服务地址 | `https://vibe.soyoung.com` |
+| `OPENAI_RESPONSES_MODEL` | Responses API 使用的模型 | `OPENAI_MODEL` 或 `gpt-5.5` |
+| `OPENAI_IMAGE_MODEL` | 图片生成模型 | `gpt-image-2` |
+| `PORT` | 服务端端口 | `80` |
+| `CORS_ORIGIN` | 允许的跨域来源，逗号分隔 | 无 |
+| `IMAGE_RATE_LIMIT_PER_HOUR` | 单 IP 每小时生成次数，`0` 关闭限流 | `20` |
+| `MAX_UPLOAD_IMAGES` | 单次上传参考图数量上限，`0` 表示不限制 | `0` |
 
-```json
-{
-  "code": 0,
-  "data": 42
-}
+单张参考图最大 20MB；服务端会检查 MIME 类型和图片文件头。
+
+## API
+
+`POST /api/generate-image-stream`
+
+使用 `multipart/form-data` 传入：
+
+- `prompt`: 生成提示词
+- `mode`: `generate` 或 `edit`
+- `size`: `auto`、`1024x1024`、`1024x1536`、`1536x1024`、`1920x1080`
+- `images`: 可选的一个或多个参考图片
+
+响应为 SSE，事件包括 `status`、`heartbeat`、`partial_image`、`final_image`、`done` 和 `error`。
+
+## 校验
+
+```bash
+npm test
+npm run frontend:build
 ```
 
-#### 调用示例
+## 项目结构
 
+```text
+index.js             Express 服务和图片生成流代理
+frontend/src/App.tsx 生成工作台与本地图片/PDF 工具
+frontend/src/styles.css 页面样式
+test/                服务端上传与限流辅助函数测试
+build/               前端生产构建输出
 ```
-curl -X POST -H 'content-type: application/json' -d '{"action": "inc"}' https://<云托管服务域名>/api/count
-```
-
-## 使用注意
-如果不是通过微信云托管控制台部署模板代码，而是自行复制/下载模板代码后，手动新建一个服务并部署，需要在「服务设置」中补全以下环境变量，才可正常使用，否则会引发无法连接数据库，进而导致部署失败。
-- MYSQL_ADDRESS
-- MYSQL_PASSWORD
-- MYSQL_USERNAME
-以上三个变量的值请按实际情况填写。如果使用云托管内MySQL，可以在控制台MySQL页面获取相关信息。
-
-
-## License
-
-[MIT](./LICENSE)

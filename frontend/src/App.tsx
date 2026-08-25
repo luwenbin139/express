@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { jsPDF } from "jspdf";
@@ -56,6 +56,14 @@ type PdfOutput = {
   pageCount: number;
 };
 
+type GenerationHistoryEntry = {
+  id: string;
+  image: string;
+  prompt: string;
+  size: string;
+  createdAt: number;
+};
+
 const API_ENDPOINT = "/api/generate-image-stream";
 const MAX_REFERENCE_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_TRANSPARENT_FILE_SIZE = 10 * 1024 * 1024;
@@ -76,6 +84,9 @@ const PDF_RENDER_MAX_DIMENSION = 4096;
 const LIGHTBOX_MIN_ZOOM = 1;
 const LIGHTBOX_MAX_ZOOM = 4;
 const LIGHTBOX_ZOOM_STEP = 0.25;
+const HISTORY_DB_NAME = "ai-image-studio";
+const HISTORY_STORE_NAME = "generation-history";
+const MAX_HISTORY_ITEMS = 12;
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -92,6 +103,112 @@ function formatElapsed(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return `${minutes}:${remainder.toString().padStart(2, "0")}`;
+}
+
+function formatHistoryTime(timestamp: number) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(timestamp);
+}
+
+function getFinalImageFileName() {
+  return `ai-image-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+}
+
+function openHistoryDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = window.indexedDB.open(HISTORY_DB_NAME, 1);
+
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(HISTORY_STORE_NAME)) {
+        const store = database.createObjectStore(HISTORY_STORE_NAME, { keyPath: "id" });
+        store.createIndex("createdAt", "createdAt");
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("无法打开本地生成历史。"));
+  });
+}
+
+async function getGenerationHistory() {
+  const database = await openHistoryDatabase();
+
+  return new Promise<GenerationHistoryEntry[]>((resolve, reject) => {
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readonly");
+    const request = transaction.objectStore(HISTORY_STORE_NAME).getAll();
+    request.onsuccess = () => {
+      database.close();
+      resolve((request.result as GenerationHistoryEntry[]).sort((first, second) => second.createdAt - first.createdAt));
+    };
+    request.onerror = () => {
+      database.close();
+      reject(request.error ?? new Error("无法读取本地生成历史。"));
+    };
+  });
+}
+
+async function saveGenerationHistory(entry: GenerationHistoryEntry) {
+  const database = await openHistoryDatabase();
+
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readwrite");
+    const store = transaction.objectStore(HISTORY_STORE_NAME);
+    store.put(entry);
+    const listRequest = store.getAll();
+
+    listRequest.onsuccess = () => {
+      const expiredItems = (listRequest.result as GenerationHistoryEntry[])
+        .sort((first, second) => second.createdAt - first.createdAt)
+        .slice(MAX_HISTORY_ITEMS);
+      expiredItems.forEach((item) => store.delete(item.id));
+    };
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error("无法保存本地生成历史。"));
+    };
+  });
+}
+
+async function deleteGenerationHistory(id: string) {
+  const database = await openHistoryDatabase();
+
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).delete(id);
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error("无法删除本地生成历史。"));
+    };
+  });
+}
+
+async function clearGenerationHistory() {
+  const database = await openHistoryDatabase();
+
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).clear();
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error("无法清空本地生成历史。"));
+    };
+  });
 }
 
 function clampLightboxZoom(value: number) {
@@ -506,6 +623,7 @@ async function parseSseStream(
 
 export default function App() {
   const location = useLocation();
+  const navigate = useNavigate();
   const [prompt, setPrompt] = useState("");
   const [refinementPrompt, setRefinementPrompt] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
@@ -517,6 +635,9 @@ export default function App() {
   const [heartbeatAt, setHeartbeatAt] = useState<string | null>(null);
   const [partialImage, setPartialImage] = useState<string | null>(null);
   const [finalImage, setFinalImage] = useState<string | null>(null);
+  const [generationHistory, setGenerationHistory] = useState<GenerationHistoryEntry[]>([]);
+  const [historyMessage, setHistoryMessage] = useState("");
+  const [resultActionMessage, setResultActionMessage] = useState("");
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [lightboxZoom, setLightboxZoom] = useState(LIGHTBOX_MIN_ZOOM);
   const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
@@ -551,6 +672,7 @@ export default function App() {
   const pdfImagePreviewUrlRef = useRef<string | null>(null);
   const pdfImageDownloadUrlRef = useRef<string | null>(null);
   const imagePdfOutputUrlRef = useRef<string | null>(null);
+  const historyRequestRef = useRef({ prompt: "", size: DEFAULT_IMAGE_SIZE, hasStoredImage: false });
   const lightboxPointersRef = useRef(new Map<number, { x: number; y: number }>());
   const lightboxPinchRef = useRef<{ distance: number; zoom: number } | null>(null);
   const lightboxPanRef = useRef<{ x: number; y: number; pan: { x: number; y: number } } | null>(null);
@@ -583,6 +705,22 @@ export default function App() {
   useEffect(() => {
     pdfImagesRef.current = pdfImages;
   }, [pdfImages]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    void getGenerationHistory()
+      .then((entries) => {
+        if (isMounted) setGenerationHistory(entries);
+      })
+      .catch(() => {
+        if (isMounted) setHistoryMessage("本地生成历史暂时不可用。");
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!lightboxImage) return undefined;
@@ -941,6 +1079,149 @@ export default function App() {
     }
   };
 
+  const recordFinalImage = (image: string) => {
+    if (historyRequestRef.current.hasStoredImage) return;
+
+    historyRequestRef.current.hasStoredImage = true;
+    const entry: GenerationHistoryEntry = {
+      id: crypto.randomUUID(),
+      image,
+      prompt: historyRequestRef.current.prompt,
+      size: historyRequestRef.current.size,
+      createdAt: Date.now(),
+    };
+
+    void saveGenerationHistory(entry)
+      .then(() => {
+        setGenerationHistory((current) => [entry, ...current.filter((item) => item.id !== entry.id)].slice(0, MAX_HISTORY_ITEMS));
+      })
+      .catch(() => {
+        setHistoryMessage("结果已生成，但未能保存到本地历史。");
+      });
+  };
+
+  const restoreHistoryEntry = (entry: GenerationHistoryEntry) => {
+    setPrompt(entry.prompt);
+    setSize(entry.size);
+    setPartialImage(null);
+    setFinalImage(entry.image);
+    setState("success");
+    setErrorMessage("");
+    setRefinementMessage("");
+    setStatus("已从本地历史恢复结果，可以继续追加生成或使用图片工具。");
+    setHistoryMessage(`已恢复 ${formatHistoryTime(entry.createdAt)} 的结果。`);
+  };
+
+  const removeHistoryEntry = async (id: string) => {
+    try {
+      await deleteGenerationHistory(id);
+      setGenerationHistory((current) => current.filter((item) => item.id !== id));
+      setHistoryMessage("已从本地历史删除该结果。");
+    } catch (error) {
+      setHistoryMessage(error instanceof Error ? error.message : "删除本地历史失败。");
+    }
+  };
+
+  const removeAllHistory = async () => {
+    try {
+      await clearGenerationHistory();
+      setGenerationHistory([]);
+      setHistoryMessage("本地生成历史已清空。");
+    } catch (error) {
+      setHistoryMessage(error instanceof Error ? error.message : "清空本地历史失败。");
+    }
+  };
+
+  const downloadFinalImage = () => {
+    if (!finalImage) return;
+
+    const link = document.createElement("a");
+    link.href = finalImage;
+    link.download = getFinalImageFileName();
+    link.click();
+    setResultActionMessage("已开始下载最终图片。");
+  };
+
+  const copyFinalImage = async () => {
+    if (!finalImage) return;
+
+    try {
+      const response = await fetch(finalImage);
+      if (!response.ok) throw new Error("无法读取最终图片。");
+      const image = await response.blob();
+
+      if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+        await navigator.clipboard.write([new ClipboardItem({ [image.type || "image/png"]: image })]);
+        setResultActionMessage("最终图片已复制到剪贴板。");
+        return;
+      }
+
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(finalImage);
+        setResultActionMessage("当前浏览器不支持复制图片，已复制图片链接。");
+        return;
+      }
+
+      throw new Error("当前浏览器不支持剪贴板操作，请改用下载。");
+    } catch (error) {
+      setResultActionMessage(error instanceof Error ? error.message : "复制图片失败，请改用下载。");
+    }
+  };
+
+  const sendFinalImageToTool = async (tool: "transparent" | "compress" | "pdf") => {
+    if (!finalImage) return;
+
+    try {
+      const file = await createImageFileFromSource(finalImage);
+
+      if (tool === "transparent") {
+        const sourceUrl = URL.createObjectURL(file);
+        if (transparentSourceUrlRef.current) URL.revokeObjectURL(transparentSourceUrlRef.current);
+        if (transparentOutputUrlRef.current) URL.revokeObjectURL(transparentOutputUrlRef.current);
+        transparentSourceUrlRef.current = sourceUrl;
+        transparentOutputUrlRef.current = null;
+        setTransparentSource({ name: file.name, previewUrl: sourceUrl, size: file.size });
+        setTransparentOutput(null);
+        setTransparentMessage("已载入当前最终图，正在本地生成透明 PNG…");
+        navigate("/tools");
+        void convertTransparentImage(file);
+      }
+
+      if (tool === "compress") {
+        const sourceUrl = URL.createObjectURL(file);
+        if (compressionSourceUrlRef.current) URL.revokeObjectURL(compressionSourceUrlRef.current);
+        if (compressionOutputUrlRef.current) URL.revokeObjectURL(compressionOutputUrlRef.current);
+        compressionFileRef.current = file;
+        compressionSourceUrlRef.current = sourceUrl;
+        compressionOutputUrlRef.current = null;
+        setCompressionSource({ name: file.name, previewUrl: sourceUrl, size: file.size });
+        setCompressionOutput(null);
+        setCompressionMessage(`已载入当前最终图，正在本地压缩到 ${formatBytes(compressionTarget)} 以内…`);
+        navigate("/tools");
+        void compressImage(file, compressionTarget);
+      }
+
+      if (tool === "pdf") {
+        const previewUrl = URL.createObjectURL(file);
+        const image: ImageFile = {
+          id: `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`,
+          file,
+          previewUrl,
+        };
+        if (imagePdfOutputUrlRef.current) URL.revokeObjectURL(imagePdfOutputUrlRef.current);
+        imagePdfOutputUrlRef.current = null;
+        setImagePdfOutput(null);
+        setPdfImages((current) => [...current, image]);
+        setImageToPdfMessage("已将当前最终图加入图片转 PDF 队列。");
+        navigate("/tools");
+      }
+
+      setResultActionMessage("已将最终图片送入本地工具。");
+    } catch (error) {
+      setResultActionMessage(error instanceof Error ? error.message : "无法将最终图片送入工具。");
+    }
+  };
+
   // 后端只暴露少量事件，前端在这里集中更新状态和图片预览。
   const handleSseMessage = (message: SseMessage): SseMessageResult => {
     const payload = extractPayload(message.data);
@@ -965,14 +1246,20 @@ export default function App() {
 
     if (message.event === "final_image") {
       const image = getImageFromPayload(payload);
-      if (image) setFinalImage(image);
+      if (image) {
+        setFinalImage(image);
+        recordFinalImage(image);
+      }
       setStatus("最终图片已返回。正在完成任务…");
       return { successfulImage: Boolean(image) };
     }
 
     if (message.event === "done") {
       const image = getImageFromPayload(payload);
-      if (image) setFinalImage(image);
+      if (image) {
+        setFinalImage(image);
+        recordFinalImage(image);
+      }
       setStatus("生成完成，可以保存结果或再次尝试。");
       setState("success");
       return { successfulImage: Boolean(image) };
@@ -996,7 +1283,7 @@ export default function App() {
     setStatus("已取消当前请求。你可以修改提示词或图片后重新开始。");
   };
 
-  const runImageRequest = async (formData: FormData, initialStatus: string) => {
+  const runImageRequest = async (formData: FormData, initialStatus: string, historyPrompt: string) => {
     abortRef.current?.abort();
 
     const controller = new AbortController();
@@ -1009,7 +1296,9 @@ export default function App() {
     setHeartbeatAt(null);
     setLightboxImage(null);
     setRefinementMessage("");
+    setResultActionMessage("");
     setStatus(initialStatus);
+    historyRequestRef.current = { prompt: historyPrompt, size, hasStoredImage: false };
 
     try {
       const response = await fetch(API_ENDPOINT, {
@@ -1072,7 +1361,7 @@ export default function App() {
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const formData = createImageFormData(prompt, size, images.map((image) => image.file));
-    await runImageRequest(formData, "正在上传 multipart/form-data 到 /api/generate-image-stream…");
+    await runImageRequest(formData, "正在上传 multipart/form-data 到 /api/generate-image-stream…", prompt);
   };
 
   const refineGeneratedImage = async (event: FormEvent<HTMLFormElement>) => {
@@ -1093,8 +1382,9 @@ export default function App() {
 
     try {
       const generatedImageFile = await createImageFileFromSource(finalImage);
-      const formData = createImageFormData(createRefinementPrompt(prompt, nextPrompt), size, [generatedImageFile]);
-      const isSuccessful = await runImageRequest(formData, "正在基于当前最终图追加生成…");
+      const refinementRequest = createRefinementPrompt(prompt, nextPrompt);
+      const formData = createImageFormData(refinementRequest, size, [generatedImageFile]);
+      const isSuccessful = await runImageRequest(formData, "正在基于当前最终图追加生成…", refinementRequest);
 
       if (isSuccessful) {
         setRefinementPrompt("");
@@ -1548,30 +1838,77 @@ export default function App() {
           </div>
 
           {finalImage && (
-            <form className="refine-form" onSubmit={refineGeneratedImage}>
-              <label className="field-label" htmlFor="refinement-prompt">
-                追加提示词
-              </label>
-              <textarea
-                id="refinement-prompt"
-                value={refinementPrompt}
-                onChange={(event) => setRefinementPrompt(event.target.value)}
-                placeholder="例如：把背景换成纯白、整体更亮、保留人物姿势..."
-                rows={3}
-                disabled={isGenerating}
-              />
-              <div className="refine-actions">
-                <button className="primary-button" type="submit" disabled={!canRefine}>
-                  {isGenerating ? "生成中…" : "追加生成"}
-                </button>
-                {refinementMessage && (
-                  <p className="refinement-message" aria-live="polite">
-                    {refinementMessage}
-                  </p>
-                )}
+            <>
+              <div className="result-actions" aria-label="最终图片操作">
+                <button className="secondary-button" type="button" onClick={downloadFinalImage}>下载</button>
+                <button className="secondary-button" type="button" onClick={() => void copyFinalImage()}>复制</button>
+                <button className="secondary-button" type="button" onClick={() => void sendFinalImageToTool("transparent")}>转透明 PNG</button>
+                <button className="secondary-button" type="button" onClick={() => void sendFinalImageToTool("compress")}>压缩</button>
+                <button className="secondary-button" type="button" onClick={() => void sendFinalImageToTool("pdf")}>加入 PDF</button>
               </div>
-            </form>
+              {resultActionMessage && <p className="result-action-message" aria-live="polite">{resultActionMessage}</p>}
+
+              <form className="refine-form" onSubmit={refineGeneratedImage}>
+                <label className="field-label" htmlFor="refinement-prompt">
+                  追加提示词
+                </label>
+                <textarea
+                  id="refinement-prompt"
+                  value={refinementPrompt}
+                  onChange={(event) => setRefinementPrompt(event.target.value)}
+                  placeholder="例如：把背景换成纯白、整体更亮、保留人物姿势..."
+                  rows={3}
+                  disabled={isGenerating}
+                />
+                <div className="refine-actions">
+                  <button className="primary-button" type="submit" disabled={!canRefine}>
+                    {isGenerating ? "生成中…" : "追加生成"}
+                  </button>
+                  {refinementMessage && (
+                    <p className="refinement-message" aria-live="polite">
+                      {refinementMessage}
+                    </p>
+                  )}
+                </div>
+              </form>
+            </>
           )}
+
+          <section className="history-panel" aria-labelledby="history-heading">
+            <div className="history-heading">
+              <div>
+                <h3 id="history-heading">本地生成历史</h3>
+                <p>最近保存 12 条结果，仅存于当前浏览器。</p>
+              </div>
+              {generationHistory.length > 0 && (
+                <button className="history-clear-button" type="button" onClick={() => void removeAllHistory()}>
+                  清空
+                </button>
+              )}
+            </div>
+            {historyMessage && <p className="history-message" aria-live="polite">{historyMessage}</p>}
+            {generationHistory.length > 0 ? (
+              <div className="history-list">
+                {generationHistory.map((entry) => (
+                  <article className="history-item" key={entry.id}>
+                    <button className="history-preview-button" type="button" onClick={() => restoreHistoryEntry(entry)} aria-label={`恢复 ${formatHistoryTime(entry.createdAt)} 的生成结果`}>
+                      <img src={entry.image} alt={`${formatHistoryTime(entry.createdAt)} 的生成结果`} />
+                    </button>
+                    <div>
+                      <strong>{formatHistoryTime(entry.createdAt)}</strong>
+                      <span>{entry.size}</span>
+                      <p title={entry.prompt}>{entry.prompt || "未填写提示词"}</p>
+                    </div>
+                    <button className="history-delete-button" type="button" onClick={() => void removeHistoryEntry(entry.id)} aria-label={`删除 ${formatHistoryTime(entry.createdAt)} 的历史记录`}>
+                      删除
+                    </button>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="history-empty">生成成功后的结果会自动保存在这里。</p>
+            )}
+          </section>
         </section>
       </div>
       {lightboxImage && (

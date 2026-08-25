@@ -797,11 +797,143 @@ select {
   align-items: center;
 }
 
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.result-actions .secondary-button {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--paper-solid);
+}
+
+.result-action-message,
+.history-message {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
 .refinement-message {
   margin: 0;
   color: var(--muted);
   font-weight: 800;
   line-height: 1.45;
+}
+
+.history-panel {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.history-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-heading h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.history-heading p,
+.history-empty {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.history-clear-button,
+.history-delete-button {
+  padding: 6px 0;
+  border-bottom: 1px solid currentColor;
+  color: var(--muted);
+  cursor: pointer;
+  background: transparent;
+  font-size: 0.84rem;
+  font-weight: 900;
+}
+
+.history-clear-button:hover,
+.history-clear-button:focus-visible,
+.history-delete-button:hover,
+.history-delete-button:focus-visible {
+  color: var(--ember);
+}
+
+.history-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.history-list .history-item:first-child {
+  border-top: 0;
+}
+
+.history-preview-button {
+  display: block;
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #e7ebe7;
+}
+
+.history-preview-button img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.history-preview-button:hover img,
+.history-preview-button:focus-visible img {
+  transform: scale(1.05);
+}
+
+.history-preview-button:focus-visible {
+  outline: 3px solid rgba(225, 185, 76, 0.86);
+  outline-offset: 2px;
+}
+
+.history-item strong,
+.history-item span,
+.history-item p {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item span,
+.history-item p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 .empty-state {

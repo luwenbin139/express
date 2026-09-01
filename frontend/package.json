@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "vite build --outDir ../build --emptyOutDir"
+    "build": "vite build --outDir ../build --emptyOutDir",
+    "test": "vitest run"
   },
   "dependencies": {
     "jspdf": "^4.2.1",
@@ -19,5 +20,8 @@
   },
   "engines": {
     "node": ">=20.19.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11"
   }
 }

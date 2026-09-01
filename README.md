@@ -6,7 +6,7 @@
 
 - 文生图与参考图编辑，支持 PNG、JPG、WebP 参考图和 SSE 流式状态
 - 基于当前生成结果追加提示词继续修改
-- 多区域局部修改：在“图片工具”页上传任意图片，框选多个区域并分别填写要求；仅上传各区域裁剪图及少量边缘上下文，浏览器按顺序羽化拼回原图，也可从生成结果直接进入
+- 多区域局部修改：在“图片工具”页上传任意图片，框选多个区域并分别填写要求；每个区域都会上传裁剪图及同尺寸 alpha mask，浏览器按顺序把结果严格限制并羽化拼回原选区，也可从生成结果直接进入
 - 最终图下载、复制，并可直接送入透明 PNG、压缩、图片转 PDF
 - 本地生成历史：浏览器 IndexedDB 保存最近 12 条结果，支持恢复和删除
 - 浏览器本地工具：智能去边框、透明 PNG、图片压缩、PDF 转图片、图片转 PDF
@@ -60,10 +60,11 @@ npm run frontend:build
 
 - `prompt`: 生成提示词
 - `mode`: `generate` 或 `edit`
-- `size`: `auto`、`1024x1024`、`1024x1536`、`1536x1024`、`1920x1080`
+- `size`: `auto`、常用预设，或 `gpt-image-2` 支持的 `WIDTHxHEIGHT`；自定义宽高必须是 16 的倍数、比例在 1:3～3:1、最长边不超过 3840px，并符合模型像素范围
 - `images`: 可选的一个或多个参考图片
+- `mask`: 可选的单张 PNG alpha mask；只能与 `mode=edit` 和一张 `images` 原图一起使用，完全透明区域表示允许修改
 
-响应为 SSE，事件包括 `status`、`heartbeat`、`partial_image`、`final_image`、`done` 和 `error`。
+响应为 SSE，事件包括 `status`、`heartbeat`、`partial_image`、`final_image`、`done` 和 `error`。精确局部编辑要求上游 Responses 服务支持 `image_generation.input_image_mask.image_url`；不支持时接口会明确报错，不会退回可能错位的无 mask 编辑。
 
 ## 校验
 
@@ -78,6 +79,7 @@ npm run frontend:build
 index.js             Express 服务和图片生成流代理
 frontend/src/App.tsx 生成工作台与本地图片/PDF 工具
 frontend/src/styles.css 页面样式
-test/                服务端上传与限流辅助函数测试
+test/                服务端上传、遮罩请求与限流辅助函数测试
+frontend/src/local-edit.test.ts  局部编辑坐标、mask 与像素合成测试
 build/               前端生产构建输出
 ```

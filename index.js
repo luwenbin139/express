@@ -23,6 +23,11 @@ const allowedImageSizes = new Set([
   "2160x3840",
   "3240x5760",
 ]);
+const CUSTOM_IMAGE_SIZE_PATTERN = /^(\d+)x(\d+)$/;
+const CUSTOM_IMAGE_MODELS = new Set(["gpt-image-2", "gpt-image-2-2026-04-21"]);
+const MIN_CUSTOM_IMAGE_PIXELS = 655_360;
+const MAX_CUSTOM_IMAGE_PIXELS = 8_294_400;
+const MAX_CUSTOM_IMAGE_EDGE = 3840;
 const MAX_UPLOAD_IMAGES = Number.parseInt(process.env.MAX_UPLOAD_IMAGES || "0", 10);
 const MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
 const JSON_BODY_LIMIT = "60mb";
@@ -134,14 +139,22 @@ function createImageRateLimiter() {
 const uploadImages = multer({
   storage: multer.memoryStorage(),
   limits: {
-    ...(hasUploadImageLimit() ? { files: MAX_UPLOAD_IMAGES, parts: MAX_UPLOAD_IMAGES + 4 } : {}),
+    ...(hasUploadImageLimit() ? { files: MAX_UPLOAD_IMAGES + 1, parts: MAX_UPLOAD_IMAGES + 5 } : {}),
     fileSize: MAX_UPLOAD_IMAGE_BYTES,
     fields: 4,
     fieldSize: 8 * 1024,
     fieldNameSize: 32,
   },
   fileFilter(req, file, callback) {
-    if (!allowedUploadMimeTypes.has(file.mimetype)) {
+    if (file.fieldname === "mask") {
+      if (file.mimetype !== "image/png") {
+        callback(new Error("局部编辑遮罩必须是 PNG 图片"));
+        return;
+      }
+    } else if (file.fieldname !== "images") {
+      callback(new Error("请使用 images 或 mask 字段上传图片"));
+      return;
+    } else if (!allowedUploadMimeTypes.has(file.mimetype)) {
       callback(new Error("仅支持 PNG、JPG 或 WebP 图片"));
       return;
     }
@@ -156,6 +169,33 @@ function hasUploadImageLimit() {
 
 function getUploadImageLimitMessage() {
   return `最多上传 ${MAX_UPLOAD_IMAGES} 张图片`;
+}
+
+function isAllowedImageSize(value) {
+  if (allowedImageSizes.has(value)) {
+    return true;
+  }
+
+  const match = typeof value === "string" ? value.match(CUSTOM_IMAGE_SIZE_PATTERN) : null;
+  if (!match || !CUSTOM_IMAGE_MODELS.has(imageModel)) {
+    return false;
+  }
+
+  const width = Number.parseInt(match[1], 10);
+  const height = Number.parseInt(match[2], 10);
+  const pixels = width * height;
+  const ratio = width / height;
+
+  return (
+    width % 16 === 0 &&
+    height % 16 === 0 &&
+    width <= MAX_CUSTOM_IMAGE_EDGE &&
+    height <= MAX_CUSTOM_IMAGE_EDGE &&
+    pixels >= MIN_CUSTOM_IMAGE_PIXELS &&
+    pixels <= MAX_CUSTOM_IMAGE_PIXELS &&
+    ratio >= 1 / 3 &&
+    ratio <= 3
+  );
 }
 
 const app = express();
@@ -363,7 +403,8 @@ function getMulterErrorMessage(error) {
     };
 
     if (error.code === "LIMIT_UNEXPECTED_FILE") {
-      return error.field && error.field !== "images" ? "请使用 images 字段上传图片" : hasUploadImageLimit() ? getUploadImageLimitMessage() : "上传图片数量过多";
+      if (error.field === "mask") return "局部编辑只能上传一个遮罩";
+      return error.field && error.field !== "images" ? "请使用 images 或 mask 字段上传图片" : hasUploadImageLimit() ? getUploadImageLimitMessage() : "上传图片数量过多";
     }
 
     if (messages[error.code]) {
@@ -380,7 +421,10 @@ function parseMultipartImageRequest(req, res, next, onError) {
     return;
   }
 
-  const parseImages = hasUploadImageLimit() ? uploadImages.array("images", MAX_UPLOAD_IMAGES) : uploadImages.array("images");
+  const parseImages = uploadImages.fields([
+    { name: "images", ...(hasUploadImageLimit() ? { maxCount: MAX_UPLOAD_IMAGES } : {}) },
+    { name: "mask", maxCount: 1 },
+  ]);
 
   parseImages(req, res, (error) => {
     if (error) {
@@ -400,12 +444,41 @@ function parseStreamImageRequest(req, res, next) {
   });
 }
 
-function getRequestImageDataUrls(req) {
-  if (isMultipartRequest(req)) {
-    return validateImageDataUrls(convertUploadedFilesToDataUrls(req.files));
+function getMultipartFiles(req, field) {
+  if (!req.files || Array.isArray(req.files)) {
+    return field === "images" && Array.isArray(req.files) ? req.files : [];
   }
 
-  return validateImageDataUrls(collectJsonImageDataUrls(req.body));
+  return Array.isArray(req.files[field]) ? req.files[field] : [];
+}
+
+function getRequestImageInput(req) {
+  if (isMultipartRequest(req)) {
+    const imageDataUrls = validateImageDataUrls(convertUploadedFilesToDataUrls(getMultipartFiles(req, "images")));
+    const maskFiles = getMultipartFiles(req, "mask");
+    let maskDataUrl = "";
+
+    if (maskFiles.length > 1) {
+      throw new Error("局部编辑只能上传一个遮罩");
+    }
+    if (maskFiles.length === 1) {
+      const maskFile = maskFiles[0];
+      if (maskFile.mimetype !== "image/png" || !isImageMagicValid("image/png", maskFile.buffer)) {
+        throw new Error("局部编辑遮罩必须是 PNG 图片");
+      }
+      if (maskFile.size > MAX_UPLOAD_IMAGE_BYTES || maskFile.buffer.length > MAX_UPLOAD_IMAGE_BYTES) {
+        throw new Error("局部编辑遮罩最大 20MB");
+      }
+      maskDataUrl = `data:image/png;base64,${maskFile.buffer.toString("base64")}`;
+    }
+
+    return { imageDataUrls, maskDataUrl };
+  }
+
+  return {
+    imageDataUrls: validateImageDataUrls(collectJsonImageDataUrls(req.body)),
+    maskDataUrl: "",
+  };
 }
 
 // gpt-5.5 这类 Responses 主模型可能把短 prompt 当普通聊天；明确要求它必须调用图片工具。
@@ -424,7 +497,7 @@ function createImageInstructionText(prompt, hasReferenceImages) {
 }
 
 // Responses API: model 是主模型，image_generation 是工具；图片模型不要直接放在 model 字段。
-function createResponsesImagePayload(prompt, size, imageDataUrls, stream) {
+function createResponsesImagePayload(prompt, size, imageDataUrls, stream, maskDataUrl = "") {
   const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
   const content = [
     {
@@ -440,6 +513,19 @@ function createResponsesImagePayload(prompt, size, imageDataUrls, stream) {
     });
   }
 
+  const imageTool = {
+    type: "image_generation",
+    model: imageModel,
+    size,
+    ...(maskDataUrl
+      ? {
+          action: "edit",
+          input_fidelity: "high",
+          input_image_mask: { image_url: maskDataUrl },
+        }
+      : {}),
+  };
+
   return {
     model: responsesModel,
     input: [
@@ -448,13 +534,7 @@ function createResponsesImagePayload(prompt, size, imageDataUrls, stream) {
         content,
       },
     ],
-    tools: [
-      {
-        type: "image_generation",
-        model: imageModel,
-        size,
-      },
-    ],
+    tools: [imageTool],
     store: false,
     stream,
   };
@@ -696,7 +776,12 @@ function flushResponsesSseBuffer(state, context) {
 }
 
 // 非 event-stream 通常是模型名、鉴权或参数错误；保留一小段 body 方便前端直接看到原因。
-function handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnce) {
+function getBadUpstreamImageMessage(statusCode, contentType, usesMask) {
+  const prefix = usesMask ? "当前图片服务不支持精确局部遮罩编辑。" : "";
+  return `${prefix}图片服务返回异常：HTTP ${statusCode} ${contentType}`;
+}
+
+function handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnce, usesMask = false) {
   const contentType = upstreamResponse.headers["content-type"] || "";
   let body = "";
 
@@ -704,7 +789,7 @@ function handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnc
     body += chunk;
   });
   upstreamResponse.on("end", () => {
-    sendStreamError(`图片服务返回异常：HTTP ${upstreamResponse.statusCode} ${contentType}`, body.slice(0, 500));
+    sendStreamError(getBadUpstreamImageMessage(upstreamResponse.statusCode, contentType, usesMask), body.slice(0, 500));
     resolveOnce();
   });
   upstreamResponse.on("error", (error) => {
@@ -754,10 +839,10 @@ function handleGoodUpstreamStream(upstreamResponse, context, state, sendStreamEr
 }
 
 // 服务端代理上游流，避免浏览器暴露 API Key，并把上游事件整理成自己的 SSE 协议。
-function streamResponsesImage(prompt, size, imageDataUrls, res, provider) {
+function streamResponsesImage(prompt, size, imageDataUrls, res, provider, maskDataUrl = "") {
   const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
   const url = new URL(`${provider.baseUrl}/v1/responses`);
-  const body = JSON.stringify(createResponsesImagePayload(prompt, size, images, true));
+  const body = JSON.stringify(createResponsesImagePayload(prompt, size, images, true, maskDataUrl));
   const client = url.protocol === "http:" ? http : https;
   let upstreamRequest;
   const sseState = { buffer: "" };
@@ -808,7 +893,7 @@ function streamResponsesImage(prompt, size, imageDataUrls, res, provider) {
         upstreamResponse.setEncoding("utf8");
 
         if (upstreamResponse.statusCode < 200 || upstreamResponse.statusCode >= 300 || !isEventStream) {
-          handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnce);
+          handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnce, Boolean(maskDataUrl));
           return;
         }
 
@@ -837,13 +922,17 @@ function streamResponsesImage(prompt, size, imageDataUrls, res, provider) {
 
 const imageRateLimiter = createImageRateLimiter();
 
-function getImageStreamRequest(req, imageDataUrls) {
+function getImageStreamRequest(req, imageDataUrls, maskDataUrl = "") {
+  const requestedSize = typeof req.body.size === "string" ? req.body.size : "";
+
   return {
     imageDataUrls,
+    maskDataUrl,
     mode: req.body.mode === "edit" ? "edit" : "generate",
     prompt: typeof req.body.prompt === "string" ? req.body.prompt.trim() : "",
     provider: resolveImageProvider(),
-    size: allowedImageSizes.has(req.body.size) ? req.body.size : "1024x1024",
+    requestedSize,
+    size: isAllowedImageSize(requestedSize) ? requestedSize : "1024x1024",
   };
 }
 
@@ -864,15 +953,32 @@ function getImageStreamValidationError(request) {
     return "图片编辑模式需要上传 PNG、JPG 或 WebP 原图";
   }
 
+  if (request.maskDataUrl && request.mode !== "edit") {
+    return "局部编辑遮罩只能用于图片编辑模式";
+  }
+
+  if (request.maskDataUrl && request.imageDataUrls.length !== 1) {
+    return "精确局部编辑需要且只能上传一张原图";
+  }
+
+  if (request.maskDataUrl && !CUSTOM_IMAGE_MODELS.has(imageModel)) {
+    return "精确局部编辑需要使用支持自定义尺寸的 gpt-image-2 模型";
+  }
+
+  if (request.maskDataUrl && !isAllowedImageSize(request.requestedSize)) {
+    return "精确局部编辑需要有效的自定义图片尺寸";
+  }
+
   return "";
 }
 
 app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (req, res) => {
   let imageDataUrls = [];
+  let maskDataUrl = "";
   let heartbeatTimer;
 
   try {
-    imageDataUrls = getRequestImageDataUrls(req);
+    ({ imageDataUrls, maskDataUrl } = getRequestImageInput(req));
   } catch (error) {
     writeSseHead(res, 400);
     endSseWithError(res, error.message);
@@ -881,7 +987,7 @@ app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (r
 
   writeSseHead(res);
 
-  const request = getImageStreamRequest(req, imageDataUrls);
+  const request = getImageStreamRequest(req, imageDataUrls, maskDataUrl);
   const validationError = getImageStreamValidationError(request);
 
   if (validationError) {
@@ -897,7 +1003,8 @@ app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (r
       request.size,
       request.mode === "edit" ? request.imageDataUrls : [],
       res,
-      request.provider
+      request.provider,
+      request.maskDataUrl
     );
   } finally {
     if (heartbeatTimer) {
@@ -935,6 +1042,12 @@ module.exports = {
   collectJsonImageDataUrls,
   validateImageDataUrls,
   convertUploadedFilesToDataUrls,
+  getRequestImageInput,
+  createResponsesImagePayload,
+  getImageStreamRequest,
+  getImageStreamValidationError,
+  getBadUpstreamImageMessage,
+  isAllowedImageSize,
   MAX_UPLOAD_IMAGES,
   MAX_UPLOAD_IMAGE_BYTES,
   JSON_BODY_LIMIT,

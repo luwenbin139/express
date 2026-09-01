@@ -1,10 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
-import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { jsPDF } from "jspdf";
-import JSZip from "jszip";
+import {
+  DEFAULT_LOCAL_EDIT_SELECTION,
+  LOCAL_EDIT_FEATHER_RATIO,
+  clampNumber,
+  compositeRgbaRegion,
+  createFeatherAlpha,
+  createLocalEditSelection,
+  getContainedImageBounds,
+  getLocalEditBounds,
+  getLocalEditContextBounds,
+  getLocalEditFeatherEdges,
+  getLocalEditModelDimensions,
+  getLocalEditTargetInContext,
+  mapLocalEditBounds,
+  paintLocalEditMask,
+} from "./local-edit";
+import type { LocalEditJob, LocalEditSelection } from "./local-edit";
 
 type ImageFile = {
   id: string;
@@ -69,27 +82,6 @@ type GenerationHistoryEntry = {
   createdAt: number;
 };
 
-type LocalEditSelection = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
-type LocalEditBounds = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
-type LocalEditJob = {
-  source: string;
-  selection: LocalEditSelection;
-  targetBounds: LocalEditBounds;
-  contextBounds: LocalEditBounds;
-};
-
 type LocalEditRegionStatus = "draft" | "processing" | "ready" | "applied" | "error";
 
 type LocalEditRegion = {
@@ -133,10 +125,6 @@ const PDF_RENDER_MAX_DIMENSION = 4096;
 const LIGHTBOX_MIN_ZOOM = 1;
 const LIGHTBOX_MAX_ZOOM = 4;
 const LIGHTBOX_ZOOM_STEP = 0.25;
-const LOCAL_EDIT_MIN_SELECTION = 8;
-const LOCAL_EDIT_CONTEXT_RATIO = 0.2;
-const LOCAL_EDIT_FEATHER_RATIO = 0.08;
-const DEFAULT_LOCAL_EDIT_SELECTION: LocalEditSelection = { x: 25, y: 25, width: 50, height: 50 };
 const LOCAL_EDIT_STATUS_LABELS: Record<LocalEditRegionStatus, string> = {
   draft: "待生成",
   processing: "生成中",
@@ -148,7 +136,32 @@ const HISTORY_DB_NAME = "ai-image-studio";
 const HISTORY_STORE_NAME = "generation-history";
 const MAX_HISTORY_ITEMS = 12;
 
-GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+const loadPdfImageTools = (() => {
+  let toolsPromise: Promise<{
+    getDocument: typeof import("pdfjs-dist").getDocument;
+    JSZip: typeof import("jszip").default;
+  }> | null = null;
+
+  return () => {
+    if (!toolsPromise) {
+      toolsPromise = Promise.all([
+        import("pdfjs-dist"),
+        import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
+        import("jszip"),
+      ]).then(([pdfjs, worker, zip]) => {
+        pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
+        return { getDocument: pdfjs.getDocument, JSZip: zip.default };
+      });
+    }
+
+    return toolsPromise;
+  };
+})();
+
+const loadPdfWriter = (() => {
+  let writerPromise: Promise<typeof import("jspdf").jsPDF> | null = null;
+  return () => writerPromise ??= import("jspdf").then(({ jsPDF }) => jsPDF);
+})();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -279,45 +292,12 @@ function normalizeLightboxRotation(value: number) {
   return ((Math.round(value) % 360) + 360) % 360;
 }
 
-function clampNumber(value: number, minimum: number, maximum: number) {
-  return Math.min(maximum, Math.max(minimum, value));
-}
-
-function createLocalEditSelection(first: { x: number; y: number }, second: { x: number; y: number }) {
-  const left = clampNumber(Math.min(first.x, second.x), 0, 100 - LOCAL_EDIT_MIN_SELECTION);
-  const top = clampNumber(Math.min(first.y, second.y), 0, 100 - LOCAL_EDIT_MIN_SELECTION);
-  const right = clampNumber(Math.max(first.x, second.x), left + LOCAL_EDIT_MIN_SELECTION, 100);
-  const bottom = clampNumber(Math.max(first.y, second.y), top + LOCAL_EDIT_MIN_SELECTION, 100);
-
-  return { x: left, y: top, width: right - left, height: bottom - top };
-}
-
-function getLocalEditBounds(image: HTMLImageElement, selection: LocalEditSelection) {
-  const sourceWidth = image.naturalWidth;
-  const sourceHeight = image.naturalHeight;
-  const x = Math.floor((selection.x / 100) * sourceWidth);
-  const y = Math.floor((selection.y / 100) * sourceHeight);
-  const right = Math.min(sourceWidth, Math.ceil(((selection.x + selection.width) / 100) * sourceWidth));
-  const bottom = Math.min(sourceHeight, Math.ceil(((selection.y + selection.height) / 100) * sourceHeight));
-
-  return { x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y) };
-}
-
-function getLocalEditContextBounds(targetBounds: LocalEditBounds, image: HTMLImageElement) {
-  const padding = Math.ceil(Math.max(targetBounds.width, targetBounds.height) * LOCAL_EDIT_CONTEXT_RATIO);
-  const x = Math.max(0, targetBounds.x - padding);
-  const y = Math.max(0, targetBounds.y - padding);
-  const right = Math.min(image.naturalWidth, targetBounds.x + targetBounds.width + padding);
-  const bottom = Math.min(image.naturalHeight, targetBounds.y + targetBounds.height + padding);
-
-  return { x, y, width: right - x, height: bottom - y };
-}
-
 function createLocalEditPrompt(prompt: string) {
   return [
     "这是一张从原图裁出的局部区域，四周包含上下文供你保持衔接。",
+    "请求附带的 alpha mask 中只有完全透明区域允许修改；不透明区域必须保持不变。",
     "只修改用户指定的内容，未提及的主体、布局、光线和边缘上下文都必须保持不变。",
-    "输出与输入局部图相同构图的修改结果，不要添加边框、文字说明或拼图。",
+    "输出必须保持输入局部图的画布比例、构图和内容位置，不要添加边框、文字说明或拼图。",
     `局部修改要求：${prompt.trim()}`,
   ].join("\n");
 }
@@ -362,12 +342,13 @@ function getImageFromPayload(payload: unknown) {
   return null;
 }
 
-function createImageFormData(prompt: string, size: string, images: File[]) {
+function createImageFormData(prompt: string, size: string, images: File[], mask?: File) {
   const formData = new FormData();
   formData.append("prompt", prompt);
   formData.append("mode", images.length > 0 ? "edit" : "generate");
   formData.append("size", size || DEFAULT_IMAGE_SIZE);
   images.forEach((image) => formData.append("images", image));
+  if (mask) formData.append("mask", mask);
   return formData;
 }
 
@@ -480,36 +461,65 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   });
 }
 
-async function createLocalEditJob(source: string, selection: LocalEditSelection): Promise<{ job: LocalEditJob; cropFile: File }> {
+async function createLocalEditJob(source: string, selection: LocalEditSelection): Promise<{ job: LocalEditJob; cropFile: File; maskFile: File }> {
   const sourceFile = await createImageFileFromSource(source);
   const image = await loadImageElement(sourceFile);
-  const targetBounds = getLocalEditBounds(image, selection);
-  const contextBounds = getLocalEditContextBounds(targetBounds, image);
+  const sourceDimensions = { width: image.naturalWidth, height: image.naturalHeight };
+  const targetBounds = getLocalEditBounds(sourceDimensions, selection);
+  const contextBounds = getLocalEditContextBounds(targetBounds, sourceDimensions);
+  const targetInContext = getLocalEditTargetInContext(targetBounds, contextBounds);
+  const modelDimensions = getLocalEditModelDimensions(contextBounds);
+  const modelBounds = { x: 0, y: 0, ...modelDimensions };
+  const modelContentBounds = getContainedImageBounds(contextBounds, modelDimensions);
+  const modelTargetBounds = mapLocalEditBounds(targetInContext, contextBounds, modelContentBounds);
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
+  const maskCanvas = document.createElement("canvas");
+  const maskContext = maskCanvas.getContext("2d");
 
-  if (!context) throw new Error("当前浏览器不支持局部图片编辑。");
+  if (!context || !maskContext) throw new Error("当前浏览器不支持局部图片编辑。");
 
-  canvas.width = contextBounds.width;
-  canvas.height = contextBounds.height;
+  canvas.width = modelDimensions.width;
+  canvas.height = modelDimensions.height;
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
   context.drawImage(
     image,
     contextBounds.x,
     contextBounds.y,
     contextBounds.width,
     contextBounds.height,
-    0,
-    0,
-    contextBounds.width,
-    contextBounds.height,
+    modelContentBounds.x,
+    modelContentBounds.y,
+    modelContentBounds.width,
+    modelContentBounds.height,
   );
 
-  const cropBlob = await canvasToBlob(canvas, "image/png");
-  const cropFile = new File([cropBlob], `local-edit-${Date.now()}.png`, { type: "image/png" });
+  maskCanvas.width = modelDimensions.width;
+  maskCanvas.height = modelDimensions.height;
+  paintLocalEditMask(maskContext, modelDimensions, modelTargetBounds);
+
+  const [cropBlob, maskBlob] = await Promise.all([
+    canvasToBlob(canvas, "image/png"),
+    canvasToBlob(maskCanvas, "image/png"),
+  ]);
+  const timestamp = Date.now();
+  const cropFile = new File([cropBlob], `local-edit-${timestamp}.png`, { type: "image/png" });
+  const maskFile = new File([maskBlob], `local-edit-mask-${timestamp}.png`, { type: "image/png" });
 
   return {
-    job: { source, selection, targetBounds, contextBounds },
+    job: {
+      source,
+      selection,
+      targetBounds,
+      contextBounds,
+      modelBounds,
+      modelContentBounds,
+      modelTargetBounds,
+      modelSize: `${modelDimensions.width}x${modelDimensions.height}`,
+    },
     cropFile,
+    maskFile,
   };
 }
 
@@ -520,69 +530,52 @@ async function createLocalEditComposite(job: LocalEditJob, generatedSource: stri
   ]);
   const [sourceImage, generatedImage] = await Promise.all([loadImageElement(sourceFile), loadImageElement(generatedFile)]);
   const outputCanvas = document.createElement("canvas");
-  const outputContext = outputCanvas.getContext("2d");
+  const outputContext = outputCanvas.getContext("2d", { willReadFrequently: true });
+  const patchCanvas = document.createElement("canvas");
+  const patchContext = patchCanvas.getContext("2d", { willReadFrequently: true });
 
-  if (!outputContext) throw new Error("当前浏览器不支持局部图片合成。");
+  if (!outputContext || !patchContext) throw new Error("当前浏览器不支持局部图片合成。");
 
   outputCanvas.width = sourceImage.naturalWidth;
   outputCanvas.height = sourceImage.naturalHeight;
   outputContext.drawImage(sourceImage, 0, 0);
 
-  const contextCanvas = document.createElement("canvas");
-  const context = contextCanvas.getContext("2d");
-  if (!context) throw new Error("当前浏览器不支持局部图片合成。");
-
-  contextCanvas.width = job.contextBounds.width;
-  contextCanvas.height = job.contextBounds.height;
-  context.drawImage(generatedImage, 0, 0, contextCanvas.width, contextCanvas.height);
-
-  const sourceX = job.targetBounds.x - job.contextBounds.x;
-  const sourceY = job.targetBounds.y - job.contextBounds.y;
-  const patchCanvas = document.createElement("canvas");
-  const patchContext = patchCanvas.getContext("2d");
-  const maskCanvas = document.createElement("canvas");
-  const maskContext = maskCanvas.getContext("2d");
-  if (!patchContext || !maskContext) throw new Error("当前浏览器不支持局部图片合成。");
-
+  const generatedTargetBounds = mapLocalEditBounds(
+    job.modelTargetBounds,
+    job.modelBounds,
+    { x: 0, y: 0, width: generatedImage.naturalWidth, height: generatedImage.naturalHeight },
+  );
   patchCanvas.width = job.targetBounds.width;
   patchCanvas.height = job.targetBounds.height;
   patchContext.drawImage(
-    contextCanvas,
-    sourceX,
-    sourceY,
-    job.targetBounds.width,
-    job.targetBounds.height,
+    generatedImage,
+    generatedTargetBounds.x,
+    generatedTargetBounds.y,
+    generatedTargetBounds.width,
+    generatedTargetBounds.height,
     0,
     0,
     patchCanvas.width,
     patchCanvas.height,
   );
 
-  maskCanvas.width = patchCanvas.width;
-  maskCanvas.height = patchCanvas.height;
-  const feather = Math.min(
-    Math.floor(Math.min(maskCanvas.width, maskCanvas.height) / 2),
-    Math.max(2, Math.round(Math.min(maskCanvas.width, maskCanvas.height) * LOCAL_EDIT_FEATHER_RATIO)),
+  const featherAlpha = createFeatherAlpha(
+    patchCanvas.width,
+    patchCanvas.height,
+    LOCAL_EDIT_FEATHER_RATIO,
+    getLocalEditFeatherEdges(job.targetBounds, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
   );
-  const horizontalMask = maskContext.createLinearGradient(0, 0, maskCanvas.width, 0);
-  horizontalMask.addColorStop(0, "rgba(0, 0, 0, 0)");
-  horizontalMask.addColorStop(feather / maskCanvas.width, "rgba(0, 0, 0, 1)");
-  horizontalMask.addColorStop(1 - feather / maskCanvas.width, "rgba(0, 0, 0, 1)");
-  horizontalMask.addColorStop(1, "rgba(0, 0, 0, 0)");
-  maskContext.fillStyle = horizontalMask;
-  maskContext.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
-  maskContext.globalCompositeOperation = "destination-in";
-  const verticalMask = maskContext.createLinearGradient(0, 0, 0, maskCanvas.height);
-  verticalMask.addColorStop(0, "rgba(0, 0, 0, 0)");
-  verticalMask.addColorStop(feather / maskCanvas.height, "rgba(0, 0, 0, 1)");
-  verticalMask.addColorStop(1 - feather / maskCanvas.height, "rgba(0, 0, 0, 1)");
-  verticalMask.addColorStop(1, "rgba(0, 0, 0, 0)");
-  maskContext.fillStyle = verticalMask;
-  maskContext.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
-
-  patchContext.globalCompositeOperation = "destination-in";
-  patchContext.drawImage(maskCanvas, 0, 0);
-  outputContext.drawImage(patchCanvas, job.targetBounds.x, job.targetBounds.y);
+  const outputImage = outputContext.getImageData(0, 0, outputCanvas.width, outputCanvas.height);
+  const patchImage = patchContext.getImageData(0, 0, patchCanvas.width, patchCanvas.height);
+  const compositePixels = compositeRgbaRegion(
+    outputImage.data,
+    { width: outputCanvas.width, height: outputCanvas.height },
+    patchImage.data,
+    job.targetBounds,
+    featherAlpha,
+  );
+  outputImage.data.set(compositePixels);
+  outputContext.putImageData(outputImage, 0, 0);
 
   return outputCanvas.toDataURL("image/png");
 }
@@ -808,7 +801,11 @@ async function createCompressedImageBlob(file: File, targetBytes: number): Promi
 }
 
 async function createPdfImageOutput(file: File, onProgress: (pageNumber: number, pageCount: number) => void): Promise<PdfImageOutput> {
-  const loadingTask = getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const [{ getDocument, JSZip }, fileData] = await Promise.all([
+    loadPdfImageTools(),
+    file.arrayBuffer(),
+  ]);
+  const loadingTask = getDocument({ data: new Uint8Array(fileData) });
   const pdfDocument = await loadingTask.promise;
   const pageCount = pdfDocument.numPages;
   const zip = new JSZip();
@@ -866,7 +863,10 @@ async function createPdfImageOutput(file: File, onProgress: (pageNumber: number,
 }
 
 async function createPdfFromImages(files: File[]) {
-  const firstImage = await loadImageElement(files[0]);
+  const [firstImage, jsPDF] = await Promise.all([
+    loadImageElement(files[0]),
+    loadPdfWriter(),
+  ]);
   const pdf = new jsPDF({
     unit: "pt",
     format: "a4",
@@ -2093,8 +2093,8 @@ export default function App() {
         setActiveLocalEditRegionId(region.id);
         setLocalEditRegions((current) => current.map((item) => item.id === region.id ? { ...item, status: "processing", message: "正在生成" } : item));
         setLocalEditMessage(`正在生成区域 ${index + 1}/${requestedRegions.length}，仅上传该区域的局部裁剪图…`);
-        const { job, cropFile } = await createLocalEditJob(composite, region.selection);
-        const formData = createImageFormData(createLocalEditPrompt(region.prompt), DEFAULT_IMAGE_SIZE, [cropFile]);
+        const { job, cropFile, maskFile } = await createLocalEditJob(composite, region.selection);
+        const formData = createImageFormData(createLocalEditPrompt(region.prompt), job.modelSize, [cropFile], maskFile);
         const response = await fetch(API_ENDPOINT, { method: "POST", body: formData, signal: controller.signal });
         const contentType = response.headers.get("content-type") ?? "";
         if (!contentType.includes("text/event-stream")) {

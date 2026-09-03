@@ -1,39 +1,43 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const path = require("path");
-const http = require("http");
-const https = require("https");
 const express = require("express");
 const multer = require("multer");
 const cors = require("cors");
 const morgan = require("morgan");
+
 const logger = morgan("tiny");
 const imageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
-const responsesModel = process.env.OPENAI_RESPONSES_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
-const allowedImageSizes = new Set([
-  "auto",
-  "1024x1024",
-  "1024x1536",
-  "1536x1024",
-  "1280x1024",
-  "1920x1080",
-  "3840x2160",
-  "5760x3240",
-  "1080x1920",
-  "2160x3840",
-  "3240x5760",
-]);
 const CUSTOM_IMAGE_SIZE_PATTERN = /^(\d+)x(\d+)$/;
 const CUSTOM_IMAGE_MODELS = new Set(["gpt-image-2", "gpt-image-2-2026-04-21"]);
 const MIN_CUSTOM_IMAGE_PIXELS = 655_360;
 const MAX_CUSTOM_IMAGE_PIXELS = 8_294_400;
 const MAX_CUSTOM_IMAGE_EDGE = 3840;
-const MAX_UPLOAD_IMAGES = Number.parseInt(process.env.MAX_UPLOAD_IMAGES || "0", 10);
+const MAX_IMAGES_API_REFERENCE_IMAGES = 16;
+const DEFAULT_MAX_UPLOAD_IMAGES = 4;
+const MAX_UPLOAD_IMAGES = getMaxUploadImages(process.env.MAX_UPLOAD_IMAGES);
 const MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES = 40 * 1024 * 1024;
+const MAX_MULTIPART_METADATA_OVERHEAD_BYTES = 64 * 1024;
+const MAX_MULTIPART_BOUNDARY_OVERHEAD_BYTES = 512;
 const JSON_BODY_LIMIT = "60mb";
+const IMAGE_PARTIAL_COUNT = 1;
+const IMAGE_REQUEST_TIMEOUT_MS = 12 * 60 * 1000;
+const DEFAULT_IMAGE_SIZE = "auto";
 const allowedUploadMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const imageDataUrlPattern = /^data:(image\/(png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
 const IMAGE_STREAM_ROUTE = "/api/generate-image-stream";
+
+function getMaxUploadImages(value) {
+  const parsed = Number(String(value ?? "").trim());
+
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_IMAGES_API_REFERENCE_IMAGES) {
+    return DEFAULT_MAX_UPLOAD_IMAGES;
+  }
+
+  return parsed;
+}
 
 function resolveImageProvider() {
   return {
@@ -124,7 +128,15 @@ function createImageRateLimiter() {
 
     if (req.path === IMAGE_STREAM_ROUTE) {
       writeSseHead(res, 429);
-      sendSseEvent(res, "error", { message });
+      sendSseEvent(res, "error", {
+        message,
+        requestId: getImageRequestId(req),
+      });
+      finishImageRequestMetric(req, {
+        outcome: "rate_limited",
+        httpStatus: 429,
+        errorStage: "rate_limit",
+      });
       res.end();
       return;
     }
@@ -139,22 +151,20 @@ function createImageRateLimiter() {
 const uploadImages = multer({
   storage: multer.memoryStorage(),
   limits: {
-    ...(hasUploadImageLimit() ? { files: MAX_UPLOAD_IMAGES + 1, parts: MAX_UPLOAD_IMAGES + 5 } : {}),
+    files: MAX_UPLOAD_IMAGES,
+    parts: MAX_UPLOAD_IMAGES + 5,
     fileSize: MAX_UPLOAD_IMAGE_BYTES,
     fields: 4,
     fieldSize: 8 * 1024,
     fieldNameSize: 32,
   },
   fileFilter(req, file, callback) {
-    if (file.fieldname === "mask") {
-      if (file.mimetype !== "image/png") {
-        callback(new Error("局部编辑遮罩必须是 PNG 图片"));
-        return;
-      }
-    } else if (file.fieldname !== "images") {
-      callback(new Error("请使用 images 或 mask 字段上传图片"));
+    if (file.fieldname !== "images") {
+      callback(new Error("请使用 images 字段上传图片"));
       return;
-    } else if (!allowedUploadMimeTypes.has(file.mimetype)) {
+    }
+
+    if (!allowedUploadMimeTypes.has(file.mimetype)) {
       callback(new Error("仅支持 PNG、JPG 或 WebP 图片"));
       return;
     }
@@ -163,16 +173,16 @@ const uploadImages = multer({
   },
 });
 
-function hasUploadImageLimit() {
-  return Number.isFinite(MAX_UPLOAD_IMAGES) && MAX_UPLOAD_IMAGES > 0;
+function getUploadImageLimitMessage(maxImages = MAX_UPLOAD_IMAGES) {
+  return `最多上传 ${maxImages} 张图片`;
 }
 
-function getUploadImageLimitMessage() {
-  return `最多上传 ${MAX_UPLOAD_IMAGES} 张图片`;
+function getUploadTotalLimitMessage(maxTotalBytes = MAX_UPLOAD_TOTAL_BYTES) {
+  return `参考图合计最大 ${Math.round(maxTotalBytes / (1024 * 1024))}MB`;
 }
 
 function isAllowedImageSize(value) {
-  if (allowedImageSizes.has(value)) {
+  if (value === "auto") {
     return true;
   }
 
@@ -198,15 +208,30 @@ function isAllowedImageSize(value) {
   );
 }
 
+function initializeImageRequest(req, res, next) {
+  if (req.method !== "POST" || req.path !== IMAGE_STREAM_ROUTE) {
+    next();
+    return;
+  }
+
+  const requestId = crypto.randomUUID();
+  req.imageRequestMetrics = {
+    requestId,
+    startedAt: Date.now(),
+  };
+  res.setHeader("X-Request-ID", requestId);
+  res.setHeader("Access-Control-Expose-Headers", "X-Request-ID");
+  next();
+}
+
 const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(cors(createCorsOptions()));
 app.use(logger);
-// 静态资源目录
+app.use(initializeImageRequest);
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(express.static(path.join(__dirname, "build")));
 
-// 首页
 app.get(["/", "/generator", "/tools"], async (req, res) => {
   res.sendFile(path.join(__dirname, "build/index.html"));
 });
@@ -263,6 +288,10 @@ function isImageDataUrl(value) {
   return typeof value === "string" && imageDataUrlPattern.test(value);
 }
 
+function normalizeImageMimeType(mimetype) {
+  return mimetype === "image/jpg" ? "image/jpeg" : mimetype;
+}
+
 function parseImageDataUrl(imageDataUrl) {
   const match = typeof imageDataUrl === "string" ? imageDataUrl.match(imageDataUrlPattern) : null;
 
@@ -270,24 +299,21 @@ function parseImageDataUrl(imageDataUrl) {
     return null;
   }
 
-  const mimetype = normalizeImageMimeType(match[1].toLowerCase());
-  const base64Data = match[3];
-
   return {
-    mimetype,
-    buffer: Buffer.from(base64Data, "base64"),
+    mimetype: normalizeImageMimeType(match[1].toLowerCase()),
+    buffer: Buffer.from(match[3], "base64"),
   };
 }
 
-function normalizeImageMimeType(mimetype) {
-  return mimetype === "image/jpg" ? "image/jpeg" : mimetype;
-}
-
 function getImageDataUrlDecodedByteLength(imageDataUrl) {
-  const base64Data = imageDataUrl.slice(imageDataUrl.indexOf(",") + 1);
-  const padding = base64Data.endsWith("==") ? 2 : base64Data.endsWith("=") ? 1 : 0;
+  const match = typeof imageDataUrl === "string" ? imageDataUrl.match(imageDataUrlPattern) : null;
+  if (!match) {
+    return 0;
+  }
 
-  return (base64Data.length / 4) * 3 - padding;
+  const base64Data = match[3];
+  const padding = base64Data.endsWith("==") ? 2 : base64Data.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((base64Data.length * 3) / 4) - padding);
 }
 
 function collectJsonImageDataUrls(body) {
@@ -308,59 +334,7 @@ function collectJsonImageDataUrls(body) {
   return imageCandidates.map((image) => image.trim()).filter(Boolean);
 }
 
-// 除了 MIME，还检查图片头，避免把伪装成图片的任意 base64 传给上游服务。
-function validateImageDataUrls(imageDataUrls) {
-  if (hasUploadImageLimit() && imageDataUrls.length > MAX_UPLOAD_IMAGES) {
-    throw new Error(getUploadImageLimitMessage());
-  }
-
-  for (const imageDataUrl of imageDataUrls) {
-    if (!isImageDataUrl(imageDataUrl)) {
-      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
-    }
-
-    if (getImageDataUrlDecodedByteLength(imageDataUrl) > MAX_UPLOAD_IMAGE_BYTES) {
-      throw new Error("单张图片最大 20MB");
-    }
-
-    const parsedImageDataUrl = parseImageDataUrl(imageDataUrl);
-
-    if (!parsedImageDataUrl || !isImageMagicValid(parsedImageDataUrl.mimetype, parsedImageDataUrl.buffer)) {
-      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
-    }
-  }
-
-  return imageDataUrls;
-}
-
-function convertUploadedFilesToDataUrls(files) {
-  const uploadedFiles = Array.isArray(files) ? files : [];
-
-  if (hasUploadImageLimit() && uploadedFiles.length > MAX_UPLOAD_IMAGES) {
-    throw new Error(getUploadImageLimitMessage());
-  }
-
-  return uploadedFiles.map((file) => {
-    if (!file || !allowedUploadMimeTypes.has(file.mimetype)) {
-      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
-    }
-
-    const buffer = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.alloc(0);
-    const size = typeof file.size === "number" ? file.size : buffer.length;
-
-    if (size > MAX_UPLOAD_IMAGE_BYTES || buffer.length > MAX_UPLOAD_IMAGE_BYTES) {
-      throw new Error("单张图片最大 20MB");
-    }
-
-    if (!isImageMagicValid(file.mimetype, buffer)) {
-      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
-    }
-
-    return `data:${file.mimetype};base64,${buffer.toString("base64")}`;
-  });
-}
-
-// multipart 请求由 multer 初筛，这里再次校验文件头，保证 JSON 和 multipart 两条入口一致。
+// multipart 请求由 multer 初筛，这里再次检查文件头；JSON 和 multipart 最终共用数量与字节限制。
 function isImageMagicValid(mimetype, buffer) {
   if (mimetype === "image/png") {
     return (
@@ -387,15 +361,144 @@ function isImageMagicValid(mimetype, buffer) {
   return false;
 }
 
+function getReferenceImageLimits(overrides = {}) {
+  return {
+    maxImages: overrides.maxImages ?? MAX_UPLOAD_IMAGES,
+    maxImageBytes: overrides.maxImageBytes ?? MAX_UPLOAD_IMAGE_BYTES,
+    maxTotalBytes: overrides.maxTotalBytes ?? MAX_UPLOAD_TOTAL_BYTES,
+  };
+}
+
+function validateReferenceImages(images, overrides) {
+  const limits = getReferenceImageLimits(overrides);
+
+  if (images.length > limits.maxImages) {
+    throw new Error(getUploadImageLimitMessage(limits.maxImages));
+  }
+
+  let totalBytes = 0;
+
+  for (const image of images) {
+    if (!image || !allowedUploadMimeTypes.has(image.mimetype) || !Buffer.isBuffer(image.buffer)) {
+      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
+    }
+
+    const size = image.buffer.length;
+
+    if (size > limits.maxImageBytes || (Number.isFinite(image.declaredSize) && image.declaredSize > limits.maxImageBytes)) {
+      throw new Error(`单张图片最大 ${Math.round(limits.maxImageBytes / (1024 * 1024))}MB`);
+    }
+
+    if (!isImageMagicValid(image.mimetype, image.buffer)) {
+      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
+    }
+
+    image.size = size;
+    totalBytes += size;
+
+    if (totalBytes > limits.maxTotalBytes) {
+      throw new Error(getUploadTotalLimitMessage(limits.maxTotalBytes));
+    }
+  }
+
+  return images;
+}
+
+function validateImageDataUrls(imageDataUrls, overrides) {
+  const limits = getReferenceImageLimits(overrides);
+
+  if (imageDataUrls.length > limits.maxImages) {
+    throw new Error(getUploadImageLimitMessage(limits.maxImages));
+  }
+
+  let estimatedTotalBytes = 0;
+  const images = imageDataUrls.map((imageDataUrl) => {
+    if (!isImageDataUrl(imageDataUrl)) {
+      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
+    }
+
+    const decodedBytes = getImageDataUrlDecodedByteLength(imageDataUrl);
+    if (decodedBytes > limits.maxImageBytes) {
+      throw new Error(`单张图片最大 ${Math.round(limits.maxImageBytes / (1024 * 1024))}MB`);
+    }
+
+    estimatedTotalBytes += decodedBytes;
+    if (estimatedTotalBytes > limits.maxTotalBytes) {
+      throw new Error(getUploadTotalLimitMessage(limits.maxTotalBytes));
+    }
+
+    const parsed = parseImageDataUrl(imageDataUrl);
+
+    if (!parsed) {
+      throw new Error("仅支持 PNG、JPG 或 WebP 图片");
+    }
+
+    return {
+      mimetype: parsed.mimetype,
+      buffer: parsed.buffer,
+      size: parsed.buffer.length,
+    };
+  });
+
+  return validateReferenceImages(images, limits);
+}
+
+function normalizeUploadedFiles(files, overrides) {
+  const uploadedFiles = Array.isArray(files) ? files : [];
+  const limits = getReferenceImageLimits(overrides);
+
+  if (uploadedFiles.length > limits.maxImages) {
+    throw new Error(getUploadImageLimitMessage(limits.maxImages));
+  }
+
+  const images = uploadedFiles.map((file) => {
+    const mimetype = file && normalizeImageMimeType(file.mimetype);
+    const buffer = file && Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.alloc(0);
+
+    return {
+      mimetype,
+      buffer,
+      size: buffer.length,
+      declaredSize: file && typeof file.size === "number" ? file.size : undefined,
+    };
+  });
+
+  return validateReferenceImages(images, limits);
+}
+
 function isMultipartRequest(req) {
   return Boolean(req.is && req.is("multipart/form-data"));
+}
+
+function getMaxMultipartRequestBytes(maxImages = MAX_UPLOAD_IMAGES) {
+  return (
+    MAX_UPLOAD_TOTAL_BYTES +
+    MAX_MULTIPART_METADATA_OVERHEAD_BYTES +
+    maxImages * MAX_MULTIPART_BOUNDARY_OVERHEAD_BYTES
+  );
+}
+
+function getMultipartContentLengthError(req) {
+  if (!isMultipartRequest(req)) {
+    return "";
+  }
+
+  const header = req.headers && req.headers["content-length"];
+  const value = Array.isArray(header) ? header[0] : header;
+
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) {
+    return "";
+  }
+
+  const contentLength = Number(value);
+  return contentLength > getMaxMultipartRequestBytes() ? getUploadTotalLimitMessage() : "";
 }
 
 function getMulterErrorMessage(error) {
   if (error && error.code) {
     const messages = {
       LIMIT_FILE_SIZE: "单张图片最大 20MB",
-      LIMIT_FILE_COUNT: hasUploadImageLimit() ? getUploadImageLimitMessage() : "上传图片数量过多",
+      LIMIT_FILE_COUNT: getUploadImageLimitMessage(),
       LIMIT_FIELD_COUNT: "上传字段过多",
       LIMIT_FIELD_VALUE: "上传字段内容过长",
       LIMIT_PART_COUNT: "上传内容过多",
@@ -403,8 +506,7 @@ function getMulterErrorMessage(error) {
     };
 
     if (error.code === "LIMIT_UNEXPECTED_FILE") {
-      if (error.field === "mask") return "局部编辑只能上传一个遮罩";
-      return error.field && error.field !== "images" ? "请使用 images 或 mask 字段上传图片" : hasUploadImageLimit() ? getUploadImageLimitMessage() : "上传图片数量过多";
+      return error.field && error.field !== "images" ? "请使用 images 字段上传图片" : getUploadImageLimitMessage();
     }
 
     if (messages[error.code]) {
@@ -421,10 +523,13 @@ function parseMultipartImageRequest(req, res, next, onError) {
     return;
   }
 
-  const parseImages = uploadImages.fields([
-    { name: "images", ...(hasUploadImageLimit() ? { maxCount: MAX_UPLOAD_IMAGES } : {}) },
-    { name: "mask", maxCount: 1 },
-  ]);
+  const contentLengthError = getMultipartContentLengthError(req);
+  if (contentLengthError) {
+    onError(contentLengthError);
+    return;
+  }
+
+  const parseImages = uploadImages.fields([{ name: "images", maxCount: MAX_UPLOAD_IMAGES }]);
 
   parseImages(req, res, (error) => {
     if (error) {
@@ -439,7 +544,15 @@ function parseMultipartImageRequest(req, res, next, onError) {
 function parseStreamImageRequest(req, res, next) {
   parseMultipartImageRequest(req, res, next, (message) => {
     writeSseHead(res, 400);
-    sendSseEvent(res, "error", { message });
+    sendSseEvent(res, "error", {
+      message,
+      requestId: getImageRequestId(req),
+    });
+    finishImageRequestMetric(req, {
+      outcome: "rejected",
+      httpStatus: 400,
+      errorStage: "upload",
+    });
     res.end();
   });
 }
@@ -454,90 +567,112 @@ function getMultipartFiles(req, field) {
 
 function getRequestImageInput(req) {
   if (isMultipartRequest(req)) {
-    const imageDataUrls = validateImageDataUrls(convertUploadedFilesToDataUrls(getMultipartFiles(req, "images")));
-    const maskFiles = getMultipartFiles(req, "mask");
-    let maskDataUrl = "";
-
-    if (maskFiles.length > 1) {
-      throw new Error("局部编辑只能上传一个遮罩");
-    }
-    if (maskFiles.length === 1) {
-      const maskFile = maskFiles[0];
-      if (maskFile.mimetype !== "image/png" || !isImageMagicValid("image/png", maskFile.buffer)) {
-        throw new Error("局部编辑遮罩必须是 PNG 图片");
-      }
-      if (maskFile.size > MAX_UPLOAD_IMAGE_BYTES || maskFile.buffer.length > MAX_UPLOAD_IMAGE_BYTES) {
-        throw new Error("局部编辑遮罩最大 20MB");
-      }
-      maskDataUrl = `data:image/png;base64,${maskFile.buffer.toString("base64")}`;
-    }
-
-    return { imageDataUrls, maskDataUrl };
+    return normalizeUploadedFiles(getMultipartFiles(req, "images"));
   }
 
+  return validateImageDataUrls(collectJsonImageDataUrls(req.body));
+}
+
+function createImageGenerationPayload(prompt, size) {
   return {
-    imageDataUrls: validateImageDataUrls(collectJsonImageDataUrls(req.body)),
-    maskDataUrl: "",
-  };
-}
-
-// gpt-5.5 这类 Responses 主模型可能把短 prompt 当普通聊天；明确要求它必须调用图片工具。
-function createImageInstructionText(prompt, hasReferenceImages) {
-  const referenceInstruction = hasReferenceImages
-    ? "参考用户上传的图片进行编辑或再创作。"
-    : "不需要等待用户补充参考图。";
-
-  return [
-    "这是一个图片生成请求，不是普通聊天请求。",
-    "必须调用 image_generation 工具输出图片，不要只回复文字。",
-    referenceInstruction,
-    "用户的原始图片描述如下：",
-    prompt,
-  ].join("\n");
-}
-
-// Responses API: model 是主模型，image_generation 是工具；图片模型不要直接放在 model 字段。
-function createResponsesImagePayload(prompt, size, imageDataUrls, stream, maskDataUrl = "") {
-  const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
-  const content = [
-    {
-      type: "input_text",
-      text: createImageInstructionText(prompt, images.length > 0),
-    },
-  ];
-
-  for (const imageDataUrl of images) {
-    content.push({
-      type: "input_image",
-      image_url: imageDataUrl,
-    });
-  }
-
-  const imageTool = {
-    type: "image_generation",
     model: imageModel,
+    prompt,
     size,
-    ...(maskDataUrl
-      ? {
-          action: "edit",
-          input_fidelity: "high",
-          input_image_mask: { image_url: maskDataUrl },
-        }
-      : {}),
+    stream: true,
+    partial_images: IMAGE_PARTIAL_COUNT,
   };
+}
+
+function getImageFileExtension(mimetype) {
+  if (mimetype === "image/jpeg") {
+    return "jpg";
+  }
+
+  if (mimetype === "image/webp") {
+    return "webp";
+  }
+
+  return "png";
+}
+
+function createImageEditFormData(prompt, size, images) {
+  const formData = new FormData();
+  formData.append("model", imageModel);
+  formData.append("prompt", prompt);
+  formData.append("size", size);
+  formData.append("stream", "true");
+  formData.append("partial_images", String(IMAGE_PARTIAL_COUNT));
+
+  images.forEach((image, index) => {
+    const blob = new Blob([image.buffer], { type: image.mimetype });
+    formData.append("image[]", blob, `reference-${index + 1}.${getImageFileExtension(image.mimetype)}`);
+  });
+
+  return formData;
+}
+
+function getImagesApiPath(operation) {
+  return operation === "edit" ? "/v1/images/edits" : "/v1/images/generations";
+}
+
+function getImageStreamRequest(req, referenceImages) {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const rawSize = body.size;
+  const hasExplicitSize = rawSize !== undefined && rawSize !== null && rawSize !== "";
+  const size = hasExplicitSize ? rawSize : DEFAULT_IMAGE_SIZE;
+  const operation = referenceImages.length > 0 ? "edit" : "generate";
 
   return {
-    model: responsesModel,
-    input: [
-      {
-        role: "user",
-        content,
-      },
-    ],
-    tools: [imageTool],
-    store: false,
-    stream,
+    referenceImages,
+    operation,
+    endpoint: getImagesApiPath(operation),
+    prompt: typeof body.prompt === "string" ? body.prompt.trim() : "",
+    provider: resolveImageProvider(),
+    requestedSize: hasExplicitSize ? rawSize : "",
+    size,
+    totalImageBytes: referenceImages.reduce((total, image) => total + image.size, 0),
   };
+}
+
+function validateImageStreamRequest(request) {
+  if (!request.prompt) {
+    return {
+      message: "请输入图片提示词",
+      statusCode: 400,
+      errorStage: "prompt",
+    };
+  }
+
+  if (request.prompt.length > 2000) {
+    return {
+      message: "提示词最多 2000 个字符",
+      statusCode: 400,
+      errorStage: "prompt",
+    };
+  }
+
+  if (!isAllowedImageSize(request.size)) {
+    return {
+      message: "输出尺寸不合法：宽高须为 16 的倍数，比例为 1:3～3:1，最长边不超过 3840px，总像素为 655360～8294400",
+      statusCode: 400,
+      errorStage: "size",
+    };
+  }
+
+  if (!request.provider.apiKey) {
+    return {
+      message: `服务端缺少 ${request.provider.missingKeyEnv} 环境变量`,
+      statusCode: 500,
+      errorStage: "configuration",
+    };
+  }
+
+  return null;
+}
+
+function getImageStreamValidationError(request) {
+  const error = validateImageStreamRequest(request);
+  return error ? error.message : "";
 }
 
 function sendSseEvent(res, event, data) {
@@ -552,14 +687,6 @@ function writeSseHead(res, statusCode = 200) {
     "Content-Type": "text/event-stream; charset=utf-8",
     "X-Accel-Buffering": "no",
   });
-}
-
-function endSseWithError(res, message, extra) {
-  sendSseEvent(res, "error", {
-    message,
-    ...(extra || {}),
-  });
-  res.end();
 }
 
 function sendSseEventIfWritable(res, event, data) {
@@ -604,59 +731,30 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function getStreamImageApiName(context) {
-  return context.images.length > 0 ? "responses_stream_edit" : "responses_stream";
+function getImageRequestId(req) {
+  return (req.imageRequestMetrics && req.imageRequestMetrics.requestId) || "";
 }
 
 function getStreamImageMetadata(context) {
   return {
     model: imageModel,
-    imageToolModel: imageModel,
-    responseModel: responsesModel,
-    responsesModel,
-    api: getStreamImageApiName(context),
+    api: context.operation === "edit" ? "images_edit" : "images_generation",
+    endpoint: context.endpoint,
+    requestId: context.requestId,
   };
 }
 
-function getResponseOutputSummary(data) {
-  const output = data && data.response && Array.isArray(data.response.output) ? data.response.output : [];
-
-  return output
-    .map((item) => {
-      if (!isPlainObject(item)) {
-        return typeof item;
-      }
-
-      const label = [item.type, item.status].filter(Boolean).join(":") || "object";
-
-      if (item.type !== "message") {
-        return label;
-      }
-
-      const text = normalizeMessageOutputText(item);
-      return text ? `${label}:${text.slice(0, 160)}` : label;
-    })
-    .slice(0, 10);
+function markFirstImage(context) {
+  if (context.metrics && !context.metrics.firstImageAt) {
+    context.metrics.firstImageAt = Date.now();
+  }
 }
 
-function normalizeMessageOutputText(item) {
-  const content = Array.isArray(item.content) ? item.content : [];
-
-  for (const part of content) {
-    if (!isPlainObject(part)) {
-      continue;
-    }
-
-    if (typeof part.text === "string") {
-      return part.text;
-    }
-
-    if (typeof part.output_text === "string") {
-      return part.output_text;
-    }
+function markStreamCompleted(context) {
+  context.completed = true;
+  if (context.metrics) {
+    context.metrics.completedAt = Date.now();
   }
-
-  return "";
 }
 
 function sendFinalImageIfFound(context, payload) {
@@ -667,6 +765,7 @@ function sendFinalImageIfFound(context, payload) {
   }
 
   context.finalImage = image;
+  markFirstImage(context);
   sendSseEventIfWritable(context.res, "final_image", {
     image: context.finalImage,
     ...getStreamImageMetadata(context),
@@ -674,18 +773,38 @@ function sendFinalImageIfFound(context, payload) {
   return true;
 }
 
-function markResponsesStreamComplete(context) {
-  context.completed = true;
+function getImagesApiErrorMessage(data) {
+  if (isPlainObject(data) && isPlainObject(data.error) && typeof data.error.message === "string") {
+    return data.error.message;
+  }
+
+  if (isPlainObject(data) && typeof data.message === "string") {
+    return data.message;
+  }
+
+  return "图片服务返回了错误事件";
 }
 
-// 把上游 Responses SSE 翻译成前端只关心的 status/partial_image/final_image/done/error。
-function processResponsesSseBlock(block, context) {
-  const parsed = parseSseBlock(block.trim());
-  if (!parsed.data || parsed.data === "[DONE]") {
+function sendImagesStreamError(context, message, options = {}) {
+  if (context.completed) {
     return;
   }
 
-  if (context.completed) {
+  context.failed = true;
+  sendSseEventIfWritable(context.res, "error", {
+    message,
+    ...(options.detail ? { detail: options.detail } : {}),
+    ...(options.errorCode ? { errorCode: options.errorCode } : {}),
+    ...(options.retryable ? { retryable: true } : {}),
+    ...getStreamImageMetadata(context),
+  });
+  markStreamCompleted(context);
+}
+
+// 把 Images API 的生成/编辑事件翻译成前端稳定使用的 SSE 协议。
+function processImagesSseBlock(block, context) {
+  const parsed = parseSseBlock(block.trim());
+  if (!parsed.data || parsed.data === "[DONE]" || context.completed) {
     return;
   }
 
@@ -696,55 +815,28 @@ function processResponsesSseBlock(block, context) {
     return;
   }
 
-  if (!isPlainObject(data) || typeof data.type !== "string") {
+  if (!isPlainObject(data)) {
     return;
   }
 
-  if (data.type === "response.image_generation_call.in_progress") {
-    sendSseEventIfWritable(context.res, "status", {
-      message: "图片任务已开始...",
-    });
-    return;
-  }
+  const type = typeof data.type === "string" ? data.type : parsed.event;
 
-  if (data.type === "response.image_generation_call.generating") {
-    sendSseEventIfWritable(context.res, "status", {
-      message: "正在生成图片，请继续等待...",
-    });
-    return;
-  }
-
-  if (data.type === "response.image_generation_call.partial_image" && typeof data.partial_image_b64 === "string") {
-    sendSseEventIfWritable(context.res, "partial_image", {
-      image: `data:image/png;base64,${data.partial_image_b64}`,
-    });
-    return;
-  }
-
-  if (data.type === "response.output_item.done" && isPlainObject(data.item)) {
-    if (sendFinalImageIfFound(context, data.item)) {
-      sendSseEventIfWritable(context.res, "done", {
-        image: context.finalImage,
+  if (type === "image_generation.partial_image" || type === "image_edit.partial_image") {
+    const image = normalizeImagePayload(data.b64_json);
+    if (image) {
+      markFirstImage(context);
+      sendSseEventIfWritable(context.res, "partial_image", {
+        image,
+        partialImageIndex: data.partial_image_index,
         ...getStreamImageMetadata(context),
       });
-      markResponsesStreamComplete(context);
     }
     return;
   }
 
-  if (data.type === "response.completed") {
-    // 有些服务只在 completed.response.output 里给最终图，所以这里做一次兜底提取。
-    if (!context.finalImage) {
-      sendFinalImageIfFound(context, data.response && data.response.output);
-    }
-
-    if (!context.finalImage) {
-      sendSseEventIfWritable(context.res, "error", {
-        message: "图片服务已完成，但未返回可展示的图片",
-        responseStatus: data.response && data.response.status,
-        output: getResponseOutputSummary(data),
-        ...getStreamImageMetadata(context),
-      });
+  if (type === "image_generation.completed" || type === "image_edit.completed") {
+    if (!sendFinalImageIfFound(context, data.b64_json)) {
+      sendImagesStreamError(context, "图片服务已完成，但未返回可展示的图片");
       return;
     }
 
@@ -752,265 +844,403 @@ function processResponsesSseBlock(block, context) {
       image: context.finalImage,
       ...getStreamImageMetadata(context),
     });
-    markResponsesStreamComplete(context);
+    markStreamCompleted(context);
+    return;
+  }
+
+  if (type === "error" || type.endsWith(".failed")) {
+    sendImagesStreamError(context, getImagesApiErrorMessage(data));
   }
 }
 
-function processResponsesSseChunk(chunk, state, context) {
+function processImagesSseChunk(chunk, state, context) {
   state.buffer += chunk;
   const blocks = state.buffer.split(/\r?\n\r?\n/);
   state.buffer = blocks.pop() || "";
 
   for (const block of blocks) {
-    processResponsesSseBlock(block, context);
+    processImagesSseBlock(block, context);
   }
 }
 
-function flushResponsesSseBuffer(state, context) {
+function flushImagesSseBuffer(state, context) {
   if (!state.buffer.trim()) {
     return;
   }
 
-  processResponsesSseBlock(state.buffer, context);
+  processImagesSseBlock(state.buffer, context);
   state.buffer = "";
 }
 
-// 非 event-stream 通常是模型名、鉴权或参数错误；保留一小段 body 方便前端直接看到原因。
-function getBadUpstreamImageMessage(statusCode, contentType, usesMask) {
-  const prefix = usesMask ? "当前图片服务不支持精确局部遮罩编辑。" : "";
-  return `${prefix}图片服务返回异常：HTTP ${statusCode} ${contentType}`;
+function processImagesJsonResponse(payload, context) {
+  if (!sendFinalImageIfFound(context, payload)) {
+    sendImagesStreamError(context, "图片服务已完成，但未返回可展示的图片");
+    return false;
+  }
+
+  sendSseEventIfWritable(context.res, "done", {
+    image: context.finalImage,
+    ...getStreamImageMetadata(context),
+  });
+  markStreamCompleted(context);
+  return true;
 }
 
-function handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnce, usesMask = false) {
-  const contentType = upstreamResponse.headers["content-type"] || "";
-  let body = "";
-
-  upstreamResponse.on("data", (chunk) => {
-    body += chunk;
-  });
-  upstreamResponse.on("end", () => {
-    sendStreamError(getBadUpstreamImageMessage(upstreamResponse.statusCode, contentType, usesMask), body.slice(0, 500));
-    resolveOnce();
-  });
-  upstreamResponse.on("error", (error) => {
-    sendStreamError(error.message || "图片生成流响应失败");
-    resolveOnce();
-  });
-  upstreamResponse.on("aborted", () => {
-    sendStreamError("图片生成流响应已中断");
-    resolveOnce();
-  });
+function getBadUpstreamImageMessage(statusCode, contentType) {
+  return `图片服务返回异常：HTTP ${statusCode} ${contentType}`;
 }
 
-function handleGoodUpstreamStream(upstreamResponse, context, state, sendStreamError, resolveOnce) {
-  sendSseEventIfWritable(context.res, "status", {
-    message: "已连接图片生成流，正在等待模型返回...",
-  });
+function parseUpstreamImageError(body) {
+  if (typeof body !== "string" || !body.trim()) {
+    return { code: "", message: "" };
+  }
 
-  const finishIfCompleted = () => {
-    if (!context.completed) {
-      return;
-    }
+  try {
+    const payload = JSON.parse(body);
+    const error = isPlainObject(payload) && isPlainObject(payload.error) ? payload.error : payload;
 
-    upstreamResponse.destroy();
-    resolveOnce();
+    return {
+      code:
+        isPlainObject(error) && typeof error.type === "string"
+          ? error.type
+          : isPlainObject(error) && typeof error.code === "string"
+            ? error.code
+            : "",
+      message: isPlainObject(error) && typeof error.message === "string" ? error.message.trim() : "",
+    };
+  } catch (error) {
+    return { code: "", message: "" };
+  }
+}
+
+function getBadUpstreamImageError(statusCode, contentType, body) {
+  const parsed = parseUpstreamImageError(body);
+
+  if (statusCode === 429 || parsed.code === "rate_limit_exceeded") {
+    const isRequestsPerMinuteLimit = /requests-per-minute/i.test(parsed.message);
+
+    return {
+      message: isRequestsPerMinuteLimit
+        ? "上游图片服务的每分钟请求次数已达上限，请稍后再试。"
+        : "上游图片服务暂时限流，请稍后再试。",
+      detail: parsed.message,
+      errorCode: parsed.code || "rate_limit_exceeded",
+      retryable: true,
+    };
+  }
+
+  return {
+    message: getBadUpstreamImageMessage(statusCode, contentType),
+    detail: parsed.message || (typeof body === "string" ? body.slice(0, 500) : ""),
+    ...(parsed.code ? { errorCode: parsed.code } : {}),
+  };
+}
+
+function createImageRequestMetric(metrics, result = {}, endedAt = Date.now()) {
+  const startedAt = Number.isFinite(metrics && metrics.startedAt) ? metrics.startedAt : endedAt;
+  const durationFromStart = (timestamp) =>
+    Number.isFinite(timestamp) ? Math.max(0, timestamp - startedAt) : undefined;
+  const record = {
+    event: "image_request",
+    requestId: metrics && metrics.requestId ? metrics.requestId : "",
+    operation: metrics && metrics.operation,
+    imageCount: metrics && metrics.imageCount,
+    totalImageBytes: metrics && metrics.totalImageBytes,
+    size: metrics && metrics.size,
+    endpoint: metrics && metrics.endpoint,
+    model: metrics && metrics.model,
+    upstreamHttpStatus: result.upstreamHttpStatus ?? (metrics && metrics.upstreamHttpStatus),
+    connectMs: durationFromStart(metrics && metrics.upstreamConnectedAt),
+    firstImageMs: durationFromStart(metrics && metrics.firstImageAt),
+    completedMs: durationFromStart(metrics && metrics.completedAt),
+    durationMs: Math.max(0, endedAt - startedAt),
+    httpStatus: result.httpStatus,
+    outcome: result.outcome || "unknown",
+    errorStage: result.errorStage,
   };
 
-  upstreamResponse.on("error", (error) => {
-    if (!context.completed) {
-      sendStreamError(error.message || "图片生成流响应失败");
-    }
-    resolveOnce();
-  });
-  upstreamResponse.on("aborted", () => {
-    if (!context.completed) {
-      sendStreamError("图片生成流响应已中断");
-    }
-    resolveOnce();
-  });
-  upstreamResponse.on("data", (chunk) => {
-    processResponsesSseChunk(chunk, state, context);
-    finishIfCompleted();
-  });
-  upstreamResponse.on("end", () => {
-    flushResponsesSseBuffer(state, context);
-    resolveOnce();
+  return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+
+function finishImageRequestMetric(req, result) {
+  const metrics = req.imageRequestMetrics;
+  if (!metrics || metrics.logged) {
+    return;
+  }
+
+  metrics.logged = true;
+  console.info(JSON.stringify(createImageRequestMetric(metrics, result)));
+}
+
+function enrichImageRequestMetrics(req, request) {
+  if (!req.imageRequestMetrics) {
+    return;
+  }
+
+  Object.assign(req.imageRequestMetrics, {
+    operation: request.operation,
+    imageCount: request.referenceImages.length,
+    totalImageBytes: request.totalImageBytes,
+    size: request.size,
+    endpoint: request.endpoint,
+    model: imageModel,
   });
 }
 
-// 服务端代理上游流，避免浏览器暴露 API Key，并把上游事件整理成自己的 SSE 协议。
-function streamResponsesImage(prompt, size, imageDataUrls, res, provider, maskDataUrl = "") {
-  const images = Array.isArray(imageDataUrls) ? imageDataUrls : [];
-  const url = new URL(`${provider.baseUrl}/v1/responses`);
-  const body = JSON.stringify(createResponsesImagePayload(prompt, size, images, true, maskDataUrl));
-  const client = url.protocol === "http:" ? http : https;
-  let upstreamRequest;
-  const sseState = { buffer: "" };
-  const sseContext = {
+function createImagesStreamContext(request, res, metrics) {
+  return {
     completed: false,
+    failed: false,
     finalImage: "",
-    images,
+    operation: request.operation,
+    endpoint: request.endpoint,
+    requestId: metrics && metrics.requestId ? metrics.requestId : "",
+    metrics,
     res,
   };
+}
 
-  return new Promise((resolve) => {
-    let settled = false;
-    const resolveOnce = () => {
-      if (!settled) {
-        settled = true;
-        resolve();
+async function consumeImagesSseResponse(upstreamResponse, context) {
+  if (!upstreamResponse.body) {
+    sendImagesStreamError(context, "图片服务没有返回可读取的响应流");
+    return;
+  }
+
+  const reader = upstreamResponse.body.getReader();
+  const decoder = new TextDecoder();
+  const state = { buffer: "" };
+
+  try {
+    while (!context.completed) {
+      const { done, value } = await reader.read();
+      if (value) {
+        processImagesSseChunk(decoder.decode(value, { stream: !done }), state, context);
       }
-    };
-    const sendStreamError = (message, detail) => {
-      if (settled) {
-        return;
+
+      if (done) {
+        break;
       }
+    }
 
-      const data = { message };
-
-      if (detail) {
-        data.detail = detail;
+    if (!context.completed) {
+      const remainder = decoder.decode();
+      if (remainder) {
+        processImagesSseChunk(remainder, state, context);
       }
+      flushImagesSseBuffer(state, context);
+    }
+  } finally {
+    if (context.completed) {
+      await reader.cancel().catch(() => {});
+    }
+    reader.releaseLock();
+  }
 
-      sendSseEventIfWritable(res, "error", data);
-    };
+  if (!context.completed) {
+    sendImagesStreamError(context, "图片生成流已结束，但未返回最终图片");
+  }
+}
 
-    upstreamRequest = client.request(
-      url,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${provider.apiKey}`,
-          Accept: "text/event-stream",
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-        },
-      },
-      (upstreamResponse) => {
-        const contentType = upstreamResponse.headers["content-type"] || "";
-        const isEventStream = contentType.includes("text/event-stream");
+async function readUpstreamResponseText(upstreamResponse) {
+  try {
+    return await upstreamResponse.text();
+  } catch (error) {
+    return "";
+  }
+}
 
-        upstreamResponse.setEncoding("utf8");
+async function streamImagesApi(request, res, metrics) {
+  const url = new URL(`${request.provider.baseUrl}${request.endpoint}`);
+  const controller = new AbortController();
+  const context = createImagesStreamContext(request, res, metrics);
+  let timedOut = false;
+  let clientClosed = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, IMAGE_REQUEST_TIMEOUT_MS);
+  const closeUpstream = () => {
+    clientClosed = true;
+    controller.abort();
+  };
+  res.once("close", closeUpstream);
 
-        if (upstreamResponse.statusCode < 200 || upstreamResponse.statusCode >= 300 || !isEventStream) {
-          handleBadUpstreamResponse(upstreamResponse, sendStreamError, resolveOnce, Boolean(maskDataUrl));
-          return;
-        }
-
-        handleGoodUpstreamStream(upstreamResponse, sseContext, sseState, sendStreamError, resolveOnce);
-      }
-    );
-
-    upstreamRequest.setTimeout(12 * 60 * 1000, () => {
-      upstreamRequest.destroy(new Error("图片生成流请求超时，请稍后重试"));
-    });
-    upstreamRequest.on("error", (error) => {
-      sendStreamError(error.message || "图片生成流请求失败");
-      resolveOnce();
-    });
-    upstreamRequest.write(body);
-    upstreamRequest.end();
-
-    res.on("close", () => {
-      if (upstreamRequest) {
-        upstreamRequest.destroy();
-      }
-      resolveOnce();
-    });
+  sendSseEventIfWritable(res, "status", {
+    message: request.operation === "edit" ? "正在上传参考图并连接图片编辑服务..." : "正在连接图片生成服务...",
+    ...getStreamImageMetadata(context),
   });
+
+  try {
+    const headers = {
+      Authorization: `Bearer ${request.provider.apiKey}`,
+      Accept: "text/event-stream, application/json",
+    };
+    let body;
+
+    if (request.operation === "edit") {
+      body = createImageEditFormData(request.prompt, request.size, request.referenceImages);
+    } else {
+      body = JSON.stringify(createImageGenerationPayload(request.prompt, request.size));
+      headers["Content-Type"] = "application/json";
+    }
+
+    const upstreamResponse = await fetch(url, {
+      method: "POST",
+      headers,
+      body,
+      signal: controller.signal,
+    });
+    metrics.upstreamConnectedAt = Date.now();
+    metrics.upstreamHttpStatus = upstreamResponse.status;
+    sendSseEventIfWritable(res, "status", {
+      message: "图片服务已响应，正在读取结果...",
+      ...getStreamImageMetadata(context),
+    });
+    const contentType = upstreamResponse.headers.get("content-type") || "";
+
+    if (!upstreamResponse.ok) {
+      const body = (await readUpstreamResponseText(upstreamResponse)).slice(0, 500);
+      const upstreamError = getBadUpstreamImageError(upstreamResponse.status, contentType, body);
+      sendImagesStreamError(context, upstreamError.message, upstreamError);
+      return {
+        outcome: "upstream_error",
+        httpStatus: 502,
+        upstreamHttpStatus: upstreamResponse.status,
+        errorStage: "upstream_http",
+      };
+    }
+
+    sendSseEventIfWritable(res, "status", {
+      message: "已连接图片服务，正在等待模型返回...",
+      ...getStreamImageMetadata(context),
+    });
+
+    if (contentType.includes("text/event-stream")) {
+      await consumeImagesSseResponse(upstreamResponse, context);
+    } else {
+      const responseText = await readUpstreamResponseText(upstreamResponse);
+      let payload;
+
+      try {
+        payload = JSON.parse(responseText);
+      } catch (error) {
+        sendImagesStreamError(context, getBadUpstreamImageMessage(upstreamResponse.status, contentType), {
+          detail: responseText.slice(0, 500),
+        });
+      }
+
+      if (!context.completed) {
+        if (payload) {
+          processImagesJsonResponse(payload, context);
+        } else {
+          sendImagesStreamError(context, "图片服务已完成，但未返回可展示的图片");
+        }
+      }
+    }
+
+    return {
+      outcome: context.failed ? "upstream_error" : "success",
+      httpStatus: context.failed ? 502 : 200,
+      upstreamHttpStatus: upstreamResponse.status,
+      ...(context.failed ? { errorStage: "upstream_response" } : {}),
+    };
+  } catch (error) {
+    if (clientClosed) {
+      return {
+        outcome: "cancelled",
+        httpStatus: 499,
+        errorStage: "client_disconnect",
+      };
+    }
+
+    const message = timedOut
+      ? "图片生成请求超时，请稍后重试"
+      : error instanceof Error && error.message
+        ? error.message
+        : "图片生成请求失败";
+    sendImagesStreamError(context, message);
+    return {
+      outcome: timedOut ? "timeout" : "upstream_error",
+      httpStatus: timedOut ? 504 : 502,
+      errorStage: timedOut ? "timeout" : "upstream_request",
+    };
+  } finally {
+    clearTimeout(timeout);
+    res.off("close", closeUpstream);
+  }
 }
 
 const imageRateLimiter = createImageRateLimiter();
 
-function getImageStreamRequest(req, imageDataUrls, maskDataUrl = "") {
-  const requestedSize = typeof req.body.size === "string" ? req.body.size : "";
-
-  return {
-    imageDataUrls,
-    maskDataUrl,
-    mode: req.body.mode === "edit" ? "edit" : "generate",
-    prompt: typeof req.body.prompt === "string" ? req.body.prompt.trim() : "",
-    provider: resolveImageProvider(),
-    requestedSize,
-    size: isAllowedImageSize(requestedSize) ? requestedSize : "1024x1024",
-  };
-}
-
-function getImageStreamValidationError(request) {
-  if (!request.provider.apiKey) {
-    return `服务端缺少 ${request.provider.missingKeyEnv} 环境变量`;
-  }
-
-  if (!request.prompt) {
-    return "请输入图片提示词";
-  }
-
-  if (request.prompt.length > 2000) {
-    return "提示词最多 2000 个字符";
-  }
-
-  if (request.mode === "edit" && request.imageDataUrls.length === 0) {
-    return "图片编辑模式需要上传 PNG、JPG 或 WebP 原图";
-  }
-
-  if (request.maskDataUrl && request.mode !== "edit") {
-    return "局部编辑遮罩只能用于图片编辑模式";
-  }
-
-  if (request.maskDataUrl && request.imageDataUrls.length !== 1) {
-    return "精确局部编辑需要且只能上传一张原图";
-  }
-
-  if (request.maskDataUrl && !CUSTOM_IMAGE_MODELS.has(imageModel)) {
-    return "精确局部编辑需要使用支持自定义尺寸的 gpt-image-2 模型";
-  }
-
-  if (request.maskDataUrl && !isAllowedImageSize(request.requestedSize)) {
-    return "精确局部编辑需要有效的自定义图片尺寸";
-  }
-
-  return "";
-}
-
 app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (req, res) => {
-  let imageDataUrls = [];
-  let maskDataUrl = "";
+  let referenceImages = [];
   let heartbeatTimer;
+  let metricResult = {
+    outcome: "server_error",
+    httpStatus: 500,
+    errorStage: "server",
+  };
 
   try {
-    ({ imageDataUrls, maskDataUrl } = getRequestImageInput(req));
+    try {
+      referenceImages = getRequestImageInput(req);
+    } catch (error) {
+      writeSseHead(res, 400);
+      sendSseEvent(res, "error", {
+        message: error.message,
+        requestId: getImageRequestId(req),
+      });
+      metricResult = {
+        outcome: "rejected",
+        httpStatus: 400,
+        errorStage: "upload",
+      };
+      return;
+    }
+
+    const request = getImageStreamRequest(req, referenceImages);
+    enrichImageRequestMetrics(req, request);
+    const validationError = validateImageStreamRequest(request);
+
+    if (validationError) {
+      writeSseHead(res, validationError.statusCode);
+      sendSseEvent(res, "error", {
+        message: validationError.message,
+        requestId: getImageRequestId(req),
+      });
+      metricResult = {
+        outcome: validationError.statusCode === 400 ? "rejected" : "configuration_error",
+        httpStatus: validationError.statusCode,
+        errorStage: validationError.errorStage,
+      };
+      return;
+    }
+
+    writeSseHead(res);
+    heartbeatTimer = startSseHeartbeat(res);
+    metricResult = await streamImagesApi(request, res, req.imageRequestMetrics);
   } catch (error) {
-    writeSseHead(res, 400);
-    endSseWithError(res, error.message);
-    return;
-  }
+    if (!res.headersSent) {
+      writeSseHead(res, 500);
+    }
 
-  writeSseHead(res);
-
-  const request = getImageStreamRequest(req, imageDataUrls, maskDataUrl);
-  const validationError = getImageStreamValidationError(request);
-
-  if (validationError) {
-    endSseWithError(res, validationError);
-    return;
-  }
-
-  heartbeatTimer = startSseHeartbeat(res);
-
-  try {
-    await streamResponsesImage(
-      request.prompt,
-      request.size,
-      request.mode === "edit" ? request.imageDataUrls : [],
-      res,
-      request.provider,
-      request.maskDataUrl
-    );
+    sendSseEventIfWritable(res, "error", {
+      message: error instanceof Error ? error.message : "图片生成请求失败",
+      requestId: getImageRequestId(req),
+    });
+    metricResult = {
+      outcome: "server_error",
+      httpStatus: 500,
+      errorStage: "server",
+    };
   } finally {
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
     }
-    res.end();
+    finishImageRequestMetric(req, metricResult);
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
 });
 
@@ -1019,6 +1249,28 @@ app.get("/api/wx_openid", async (req, res) => {
   if (req.headers["x-wx-source"]) {
     res.send(req.headers["x-wx-openid"]);
   }
+});
+
+// JSON 解析失败发生在路由前，单独转换成同一套 SSE 错误格式。
+app.use((error, req, res, next) => {
+  if (req.method !== "POST" || req.path !== IMAGE_STREAM_ROUTE) {
+    next(error);
+    return;
+  }
+
+  const isTooLarge = error && error.type === "entity.too.large";
+  const message = isTooLarge ? "JSON 请求体过大，请缩小参考图后重试" : "请求内容不是有效的 JSON";
+  writeSseHead(res, 400);
+  sendSseEvent(res, "error", {
+    message,
+    requestId: getImageRequestId(req),
+  });
+  finishImageRequestMetric(req, {
+    outcome: "rejected",
+    httpStatus: 400,
+    errorStage: isTooLarge ? "upload" : "json",
+  });
+  res.end();
 });
 
 const port = process.env.PORT || 80;
@@ -1041,15 +1293,28 @@ module.exports = {
   getImageDataUrlDecodedByteLength,
   collectJsonImageDataUrls,
   validateImageDataUrls,
-  convertUploadedFilesToDataUrls,
+  normalizeUploadedFiles,
+  validateReferenceImages,
   getRequestImageInput,
-  createResponsesImagePayload,
+  createImageGenerationPayload,
+  createImageEditFormData,
+  getImagesApiPath,
   getImageStreamRequest,
+  validateImageStreamRequest,
   getImageStreamValidationError,
+  processImagesSseBlock,
+  processImagesJsonResponse,
+  createImageRequestMetric,
+  getMultipartContentLengthError,
   getBadUpstreamImageMessage,
+  parseUpstreamImageError,
+  getBadUpstreamImageError,
+  getMaxUploadImages,
   isAllowedImageSize,
   MAX_UPLOAD_IMAGES,
   MAX_UPLOAD_IMAGE_BYTES,
+  MAX_UPLOAD_TOTAL_BYTES,
+  getMaxMultipartRequestBytes,
   JSON_BODY_LIMIT,
   allowedUploadMimeTypes,
 };

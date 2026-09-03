@@ -1,11 +1,11 @@
 {
   "name": "ai-image-studio",
   "version": "1.0.0",
-  "description": "AI 图片生成与编辑工作台，提供 React/Vite 前端与 Responses 图片生成流代理接口",
+  "description": "AI 图片生成与编辑工作台，提供 React/Vite 前端与 Images API 流代理接口",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test/image-upload-helpers.test.js && npm run test --prefix frontend",
+    "test": "node test/image-upload-helpers.test.js",
     "frontend:install": "npm install --prefix frontend",
     "frontend:build": "npm run build --prefix frontend"
   },

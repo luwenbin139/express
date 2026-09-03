@@ -1,23 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
-import {
-  DEFAULT_LOCAL_EDIT_SELECTION,
-  LOCAL_EDIT_FEATHER_RATIO,
-  clampNumber,
-  compositeRgbaRegion,
-  createFeatherAlpha,
-  createLocalEditSelection,
-  getContainedImageBounds,
-  getLocalEditBounds,
-  getLocalEditContextBounds,
-  getLocalEditFeatherEdges,
-  getLocalEditModelDimensions,
-  getLocalEditTargetInContext,
-  mapLocalEditBounds,
-  paintLocalEditMask,
-} from "./local-edit";
-import type { LocalEditJob, LocalEditSelection } from "./local-edit";
 
 type ImageFile = {
   id: string;
@@ -34,7 +17,14 @@ type SseMessage = {
 
 type SseMessageResult = {
   successfulImage?: boolean;
-  errorMessage?: string;
+  generationError?: GenerationError;
+};
+
+type GenerationError = {
+  message: string;
+  detail?: string;
+  requestId?: string;
+  retryable?: boolean;
 };
 
 type LightboxImage = {
@@ -82,32 +72,43 @@ type GenerationHistoryEntry = {
   createdAt: number;
 };
 
-type LocalEditRegionStatus = "draft" | "processing" | "ready" | "applied" | "error";
-
-type LocalEditRegion = {
+type IdPhotoSpec = {
   id: string;
-  selection: LocalEditSelection;
-  prompt: string;
-  status: LocalEditRegionStatus;
-  message: string;
+  label: string;
+  width: number;
+  height: number;
+  millimeters: string;
 };
 
-type LocalEditDrag = {
-  pointerId: number;
-  regionId: string;
-  mode: "create" | "move" | "nw" | "ne" | "sw" | "se";
-  startPoint: { x: number; y: number };
-  selection: LocalEditSelection;
+type IdPhotoBackground = {
+  id: string;
+  label: string;
+  color: string;
 };
 
 const API_ENDPOINT = "/api/generate-image-stream";
+const MAX_REFERENCE_IMAGES = 4;
 const MAX_REFERENCE_FILE_SIZE = 20 * 1024 * 1024;
+const MAX_REFERENCE_TOTAL_SIZE = 40 * 1024 * 1024;
+const MAX_PROMPT_LENGTH = 2000;
+const REFINEMENT_PROMPT_PREFIX = "请基于当前最终图继续修改，只按下面的追加要求调整，其余画面尽量保持一致。\n追加要求：";
+const MAX_REFINEMENT_PROMPT_LENGTH = MAX_PROMPT_LENGTH - REFINEMENT_PROMPT_PREFIX.length;
 const MAX_TRANSPARENT_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_TOOL_FILE_SIZE = 50 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const PDF_MIME_TYPE = "application/pdf";
 const DEFAULT_IMAGE_SIZE = "auto";
-const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "1920x1080"];
+const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "2048x1152", "1152x2048"];
+const ID_PHOTO_SPECS: IdPhotoSpec[] = [
+  { id: "one-inch", label: "一寸", width: 295, height: 413, millimeters: "25 x 35 mm" },
+  { id: "small-one-inch", label: "小一寸", width: 260, height: 378, millimeters: "22 x 32 mm" },
+  { id: "two-inch", label: "二寸", width: 413, height: 579, millimeters: "35 x 49 mm" },
+];
+const ID_PHOTO_BACKGROUNDS: IdPhotoBackground[] = [
+  { id: "blue", label: "蓝底", color: "#438EDB" },
+  { id: "white", label: "白底", color: "#FFFFFF" },
+  { id: "red", label: "红底", color: "#C8222A" },
+];
 const COMPRESSION_TARGETS = [
   { label: "1 MB", value: 1 * 1024 * 1024 },
   { label: "5 MB", value: 5 * 1024 * 1024 },
@@ -125,13 +126,6 @@ const PDF_RENDER_MAX_DIMENSION = 4096;
 const LIGHTBOX_MIN_ZOOM = 1;
 const LIGHTBOX_MAX_ZOOM = 4;
 const LIGHTBOX_ZOOM_STEP = 0.25;
-const LOCAL_EDIT_STATUS_LABELS: Record<LocalEditRegionStatus, string> = {
-  draft: "待生成",
-  processing: "生成中",
-  ready: "候选已就绪",
-  applied: "已应用",
-  error: "失败",
-};
 const HISTORY_DB_NAME = "ai-image-studio";
 const HISTORY_STORE_NAME = "generation-history";
 const MAX_HISTORY_ITEMS = 12;
@@ -292,16 +286,6 @@ function normalizeLightboxRotation(value: number) {
   return ((Math.round(value) % 360) + 360) % 360;
 }
 
-function createLocalEditPrompt(prompt: string) {
-  return [
-    "这是一张从原图裁出的局部区域，四周包含上下文供你保持衔接。",
-    "请求附带的 alpha mask 中只有完全透明区域允许修改；不透明区域必须保持不变。",
-    "只修改用户指定的内容，未提及的主体、布局、光线和边缘上下文都必须保持不变。",
-    "输出必须保持输入局部图的画布比例、构图和内容位置，不要添加边框、文字说明或拼图。",
-    `局部修改要求：${prompt.trim()}`,
-  ].join("\n");
-}
-
 function normalizeImageSource(value: unknown): string | null {
   if (typeof value !== "string" || !value.trim()) return null;
   const image = value.trim();
@@ -331,6 +315,23 @@ function getTextFromPayload(payload: unknown, fallbacks: string[]) {
   return JSON.stringify(payload);
 }
 
+function getGenerationErrorFromPayload(payload: unknown): GenerationError {
+  if (typeof payload === "string") {
+    return { message: payload || "图片生成流连接失败" };
+  }
+
+  if (!isRecord(payload)) {
+    return { message: "图片生成流连接失败" };
+  }
+
+  return {
+    message: getTextFromPayload(payload, ["error", "message"]) || "图片生成流连接失败",
+    detail: typeof payload.detail === "string" && payload.detail.trim() ? payload.detail.trim() : undefined,
+    requestId: typeof payload.requestId === "string" && payload.requestId.trim() ? payload.requestId.trim() : undefined,
+    retryable: payload.retryable === true,
+  };
+}
+
 function getImageFromPayload(payload: unknown) {
   if (typeof payload === "string") return normalizeImageSource(payload);
   if (!isRecord(payload)) return null;
@@ -342,13 +343,11 @@ function getImageFromPayload(payload: unknown) {
   return null;
 }
 
-function createImageFormData(prompt: string, size: string, images: File[], mask?: File) {
+function createImageFormData(prompt: string, size: string, images: File[]) {
   const formData = new FormData();
   formData.append("prompt", prompt);
-  formData.append("mode", images.length > 0 ? "edit" : "generate");
   formData.append("size", size || DEFAULT_IMAGE_SIZE);
   images.forEach((image) => formData.append("images", image));
-  if (mask) formData.append("mask", mask);
   return formData;
 }
 
@@ -383,17 +382,8 @@ async function createImageFileFromSource(source: string) {
   });
 }
 
-function createRefinementPrompt(originalPrompt: string, refinementPrompt: string) {
-  const basePrompt = originalPrompt.trim();
-  const extraPrompt = refinementPrompt.trim();
-
-  return [
-    basePrompt ? `原始提示词：${basePrompt}` : "",
-    "请基于当前最终图继续修改，只按下面的追加要求调整，其余画面尽量保持一致。",
-    `追加要求：${extraPrompt}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+function createRefinementPrompt(refinementPrompt: string) {
+  return `${REFINEMENT_PROMPT_PREFIX}${refinementPrompt.trim()}`;
 }
 
 function createTransparentFileName(fileName: string) {
@@ -412,6 +402,21 @@ function createBorderlessFileName(fileName: string, mimeType: string) {
   const dotIndex = fileName.lastIndexOf(".");
   const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
   return `${baseName}-no-border.${getImageFileExtension(mimeType)}`;
+}
+
+function createIdPhotoFileName(fileName: string, spec: IdPhotoSpec, background: IdPhotoBackground) {
+  return `${getFileBaseName(fileName)}-${background.id}-${spec.id}-${spec.width}x${spec.height}.png`;
+}
+
+function createIdPhotoPrompt(spec: IdPhotoSpec, background: IdPhotoBackground) {
+  return [
+    "Use case: identity-preserve.",
+    "Create a standard Chinese ID photo from this reference image.",
+    "Keep exactly the same person, face, glasses, hairstyle, pose, expression, clothing, and natural facial features.",
+    `Replace only the background with a uniform solid ${background.label} background (${background.color}), with no gradient, texture, shadow, border, watermark, or text.`,
+    `Use a ${spec.width}:${spec.height} vertical portrait composition. Center the head and shoulders, preserve appropriate top headroom, and keep the shoulders visible.`,
+    "Use clean, even studio lighting. Do not beautify, change identity, alter facial features, or add accessories.",
+  ].join("\n");
 }
 
 function getFileBaseName(fileName: string) {
@@ -461,123 +466,25 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   });
 }
 
-async function createLocalEditJob(source: string, selection: LocalEditSelection): Promise<{ job: LocalEditJob; cropFile: File; maskFile: File }> {
-  const sourceFile = await createImageFileFromSource(source);
-  const image = await loadImageElement(sourceFile);
-  const sourceDimensions = { width: image.naturalWidth, height: image.naturalHeight };
-  const targetBounds = getLocalEditBounds(sourceDimensions, selection);
-  const contextBounds = getLocalEditContextBounds(targetBounds, sourceDimensions);
-  const targetInContext = getLocalEditTargetInContext(targetBounds, contextBounds);
-  const modelDimensions = getLocalEditModelDimensions(contextBounds);
-  const modelBounds = { x: 0, y: 0, ...modelDimensions };
-  const modelContentBounds = getContainedImageBounds(contextBounds, modelDimensions);
-  const modelTargetBounds = mapLocalEditBounds(targetInContext, contextBounds, modelContentBounds);
+async function createStandardIdPhotoBlob(source: string, spec: IdPhotoSpec) {
+  const imageFile = await createImageFileFromSource(source);
+  const image = await loadImageElement(imageFile);
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
-  const maskCanvas = document.createElement("canvas");
-  const maskContext = maskCanvas.getContext("2d");
 
-  if (!context || !maskContext) throw new Error("当前浏览器不支持局部图片编辑。");
+  if (!context) throw new Error("当前浏览器不支持证件照尺寸处理。");
 
-  canvas.width = modelDimensions.width;
-  canvas.height = modelDimensions.height;
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(
-    image,
-    contextBounds.x,
-    contextBounds.y,
-    contextBounds.width,
-    contextBounds.height,
-    modelContentBounds.x,
-    modelContentBounds.y,
-    modelContentBounds.width,
-    modelContentBounds.height,
-  );
+  canvas.width = spec.width;
+  canvas.height = spec.height;
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
 
-  maskCanvas.width = modelDimensions.width;
-  maskCanvas.height = modelDimensions.height;
-  paintLocalEditMask(maskContext, modelDimensions, modelTargetBounds);
+  const scale = Math.max(spec.width / image.naturalWidth, spec.height / image.naturalHeight);
+  const width = image.naturalWidth * scale;
+  const height = image.naturalHeight * scale;
+  context.drawImage(image, (spec.width - width) / 2, (spec.height - height) / 2, width, height);
 
-  const [cropBlob, maskBlob] = await Promise.all([
-    canvasToBlob(canvas, "image/png"),
-    canvasToBlob(maskCanvas, "image/png"),
-  ]);
-  const timestamp = Date.now();
-  const cropFile = new File([cropBlob], `local-edit-${timestamp}.png`, { type: "image/png" });
-  const maskFile = new File([maskBlob], `local-edit-mask-${timestamp}.png`, { type: "image/png" });
-
-  return {
-    job: {
-      source,
-      selection,
-      targetBounds,
-      contextBounds,
-      modelBounds,
-      modelContentBounds,
-      modelTargetBounds,
-      modelSize: `${modelDimensions.width}x${modelDimensions.height}`,
-    },
-    cropFile,
-    maskFile,
-  };
-}
-
-async function createLocalEditComposite(job: LocalEditJob, generatedSource: string) {
-  const [sourceFile, generatedFile] = await Promise.all([
-    createImageFileFromSource(job.source),
-    createImageFileFromSource(generatedSource),
-  ]);
-  const [sourceImage, generatedImage] = await Promise.all([loadImageElement(sourceFile), loadImageElement(generatedFile)]);
-  const outputCanvas = document.createElement("canvas");
-  const outputContext = outputCanvas.getContext("2d", { willReadFrequently: true });
-  const patchCanvas = document.createElement("canvas");
-  const patchContext = patchCanvas.getContext("2d", { willReadFrequently: true });
-
-  if (!outputContext || !patchContext) throw new Error("当前浏览器不支持局部图片合成。");
-
-  outputCanvas.width = sourceImage.naturalWidth;
-  outputCanvas.height = sourceImage.naturalHeight;
-  outputContext.drawImage(sourceImage, 0, 0);
-
-  const generatedTargetBounds = mapLocalEditBounds(
-    job.modelTargetBounds,
-    job.modelBounds,
-    { x: 0, y: 0, width: generatedImage.naturalWidth, height: generatedImage.naturalHeight },
-  );
-  patchCanvas.width = job.targetBounds.width;
-  patchCanvas.height = job.targetBounds.height;
-  patchContext.drawImage(
-    generatedImage,
-    generatedTargetBounds.x,
-    generatedTargetBounds.y,
-    generatedTargetBounds.width,
-    generatedTargetBounds.height,
-    0,
-    0,
-    patchCanvas.width,
-    patchCanvas.height,
-  );
-
-  const featherAlpha = createFeatherAlpha(
-    patchCanvas.width,
-    patchCanvas.height,
-    LOCAL_EDIT_FEATHER_RATIO,
-    getLocalEditFeatherEdges(job.targetBounds, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
-  );
-  const outputImage = outputContext.getImageData(0, 0, outputCanvas.width, outputCanvas.height);
-  const patchImage = patchContext.getImageData(0, 0, patchCanvas.width, patchCanvas.height);
-  const compositePixels = compositeRgbaRegion(
-    outputImage.data,
-    { width: outputCanvas.width, height: outputCanvas.height },
-    patchImage.data,
-    job.targetBounds,
-    featherAlpha,
-  );
-  outputImage.data.set(compositePixels);
-  outputContext.putImageData(outputImage, 0, 0);
-
-  return outputCanvas.toDataURL("image/png");
+  return canvasToBlob(canvas, "image/png");
 }
 
 function isNearWhiteBorderPixel(data: Uint8ClampedArray, index: number) {
@@ -984,15 +891,13 @@ export default function App() {
   const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
   const [lightboxRotation, setLightboxRotation] = useState(0);
   const [isLightboxDragging, setIsLightboxDragging] = useState(false);
-  const [isLocalEditMode, setIsLocalEditMode] = useState(false);
-  const [localEditStandaloneSource, setLocalEditStandaloneSource] = useState<TransparentPreview | null>(null);
-  const [localEditRegions, setLocalEditRegions] = useState<LocalEditRegion[]>([]);
-  const [activeLocalEditRegionId, setActiveLocalEditRegionId] = useState<string | null>(null);
-  const [localEditImageSize, setLocalEditImageSize] = useState<{ width: number; height: number } | null>(null);
-  const [localEditMessage, setLocalEditMessage] = useState("");
-  const [localEditPreview, setLocalEditPreview] = useState<string | null>(null);
-  const [localEditPreviewRegionIds, setLocalEditPreviewRegionIds] = useState<string[]>([]);
-  const [isLocalEditing, setIsLocalEditing] = useState(false);
+  const [idPhotoSource, setIdPhotoSource] = useState<TransparentPreview | null>(null);
+  const [idPhotoPartial, setIdPhotoPartial] = useState<string | null>(null);
+  const [idPhotoOutput, setIdPhotoOutput] = useState<TransparentPreview | null>(null);
+  const [idPhotoSpecId, setIdPhotoSpecId] = useState(ID_PHOTO_SPECS[0].id);
+  const [idPhotoBackgroundId, setIdPhotoBackgroundId] = useState(ID_PHOTO_BACKGROUNDS[0].id);
+  const [idPhotoMessage, setIdPhotoMessage] = useState("");
+  const [isIdPhotoProcessing, setIsIdPhotoProcessing] = useState(false);
   const [transparentSource, setTransparentSource] = useState<TransparentPreview | null>(null);
   const [transparentOutput, setTransparentOutput] = useState<TransparentPreview | null>(null);
   const [transparentMessage, setTransparentMessage] = useState("");
@@ -1014,11 +919,15 @@ export default function App() {
   const [imagePdfOutput, setImagePdfOutput] = useState<PdfOutput | null>(null);
   const [imageToPdfMessage, setImageToPdfMessage] = useState("");
   const [isImagePdfProcessing, setIsImagePdfProcessing] = useState(false);
-  const [errorMessage, setErrorMessage] = useState("");
+  const [generationError, setGenerationError] = useState<GenerationError | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const imagesRef = useRef<ImageFile[]>([]);
   const pdfImagesRef = useRef<ImageFile[]>([]);
+  const idPhotoFileRef = useRef<File | null>(null);
+  const idPhotoAbortRef = useRef<AbortController | null>(null);
+  const idPhotoSourceUrlRef = useRef<string | null>(null);
+  const idPhotoOutputUrlRef = useRef<string | null>(null);
   const transparentSourceUrlRef = useRef<string | null>(null);
   const transparentOutputUrlRef = useRef<string | null>(null);
   const borderTrimSourceUrlRef = useRef<string | null>(null);
@@ -1031,9 +940,6 @@ export default function App() {
   const pdfImageDownloadUrlRef = useRef<string | null>(null);
   const imagePdfOutputUrlRef = useRef<string | null>(null);
   const historyRequestRef = useRef({ prompt: "", size: DEFAULT_IMAGE_SIZE, hasStoredImage: false });
-  const localEditAbortRef = useRef<AbortController | null>(null);
-  const localEditDragRef = useRef<LocalEditDrag | null>(null);
-  const localEditStandaloneSourceUrlRef = useRef<string | null>(null);
   const lightboxPointersRef = useRef(new Map<number, { x: number; y: number }>());
   const lightboxPinchRef = useRef<{ distance: number; zoom: number } | null>(null);
   const lightboxPanRef = useRef<{ x: number; y: number; pan: { x: number; y: number } } | null>(null);
@@ -1174,6 +1080,8 @@ export default function App() {
   useEffect(() => {
     return () => {
       imagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl));
+      if (idPhotoSourceUrlRef.current) URL.revokeObjectURL(idPhotoSourceUrlRef.current);
+      if (idPhotoOutputUrlRef.current) URL.revokeObjectURL(idPhotoOutputUrlRef.current);
       if (transparentSourceUrlRef.current) URL.revokeObjectURL(transparentSourceUrlRef.current);
       if (transparentOutputUrlRef.current) URL.revokeObjectURL(transparentOutputUrlRef.current);
       if (borderTrimSourceUrlRef.current) URL.revokeObjectURL(borderTrimSourceUrlRef.current);
@@ -1184,20 +1092,21 @@ export default function App() {
       if (pdfImagePreviewUrlRef.current) URL.revokeObjectURL(pdfImagePreviewUrlRef.current);
       if (pdfImageDownloadUrlRef.current && pdfImageDownloadUrlRef.current !== pdfImagePreviewUrlRef.current) URL.revokeObjectURL(pdfImageDownloadUrlRef.current);
       if (imagePdfOutputUrlRef.current) URL.revokeObjectURL(imagePdfOutputUrlRef.current);
-      if (localEditStandaloneSourceUrlRef.current) URL.revokeObjectURL(localEditStandaloneSourceUrlRef.current);
       pdfImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl));
       abortRef.current?.abort();
-      localEditAbortRef.current?.abort();
+      idPhotoAbortRef.current?.abort();
     };
   }, []);
 
-  // 上传和粘贴最终都走这里，保证数量、格式和大小限制一致。
+  // 上传和粘贴最终都走这里，保证数量、格式、单图大小和总大小限制一致。
   const addImageFiles = (files: File[], source: "upload" | "paste") => {
     if (state === "generating") return;
     if (!files.length) return;
 
     const nextImages: ImageFile[] = [];
     const messages: string[] = [];
+    let nextCount = images.length;
+    let nextTotalSize = images.reduce((total, image) => total + image.file.size, 0);
 
     files.forEach((file) => {
       if (!ALLOWED_TYPES.has(file.type)) {
@@ -1208,16 +1117,27 @@ export default function App() {
         messages.push(`${file.name} 超过 20MB。`);
         return;
       }
+      if (nextCount >= MAX_REFERENCE_IMAGES) {
+        messages.push(`最多添加 ${MAX_REFERENCE_IMAGES} 张参考图。`);
+        return;
+      }
+      if (nextTotalSize + file.size > MAX_REFERENCE_TOTAL_SIZE) {
+        messages.push("参考图合计不能超过 40MB。");
+        return;
+      }
+
       nextImages.push({
         id: `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`,
         file,
         previewUrl: URL.createObjectURL(file),
       });
+      nextCount += 1;
+      nextTotalSize += file.size;
     });
 
     setImages((current) => [...current, ...nextImages]);
     const successMessage = source === "paste" && nextImages.length > 0 ? `已从粘贴内容添加 ${nextImages.length} 张参考图。` : "";
-    setValidationMessage([successMessage, ...messages].filter(Boolean).join(" "));
+    setValidationMessage([successMessage, ...new Set(messages)].filter(Boolean).join(" "));
   };
 
   const handleFiles = (event: ChangeEvent<HTMLInputElement>) => {
@@ -1246,6 +1166,111 @@ export default function App() {
       if (image) URL.revokeObjectURL(image.previewUrl);
       return current.filter((item) => item.id !== id);
     });
+  };
+
+  const handleIdPhotoFile = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+    if (!file) return;
+
+    if (!ALLOWED_TYPES.has(file.type)) {
+      setIdPhotoMessage(`${file.name} 不是支持的 PNG、JPG 或 WebP 图片。`);
+      return;
+    }
+
+    if (file.size > MAX_REFERENCE_FILE_SIZE) {
+      setIdPhotoMessage(`${file.name} 超过 20MB，无法上传到证件照编辑服务。`);
+      return;
+    }
+
+    const sourceUrl = URL.createObjectURL(file);
+    if (idPhotoSourceUrlRef.current) URL.revokeObjectURL(idPhotoSourceUrlRef.current);
+    if (idPhotoOutputUrlRef.current) URL.revokeObjectURL(idPhotoOutputUrlRef.current);
+    idPhotoFileRef.current = file;
+    idPhotoSourceUrlRef.current = sourceUrl;
+    idPhotoOutputUrlRef.current = null;
+    setIdPhotoSource({ name: file.name, previewUrl: sourceUrl, size: file.size });
+    setIdPhotoPartial(null);
+    setIdPhotoOutput(null);
+    setIdPhotoMessage("已载入原图。选择规格和底色后生成证件照。");
+  };
+
+  const createIdPhoto = async () => {
+    const sourceFile = idPhotoFileRef.current;
+    const spec = ID_PHOTO_SPECS.find((item) => item.id === idPhotoSpecId) ?? ID_PHOTO_SPECS[0];
+    const background = ID_PHOTO_BACKGROUNDS.find((item) => item.id === idPhotoBackgroundId) ?? ID_PHOTO_BACKGROUNDS[0];
+    if (!sourceFile || isIdPhotoProcessing) return;
+
+    idPhotoAbortRef.current?.abort();
+    const controller = new AbortController();
+    idPhotoAbortRef.current = controller;
+    setIsIdPhotoProcessing(true);
+    setIdPhotoPartial(null);
+    setIdPhotoOutput(null);
+    setIdPhotoMessage("正在上传原图并生成证件照…");
+
+    try {
+      const response = await fetch(API_ENDPOINT, {
+        method: "POST",
+        body: createImageFormData(createIdPhotoPrompt(spec, background), "auto", [sourceFile]),
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("text/event-stream")) {
+        const message = await response.text();
+        throw new Error(message || `证件照请求失败：HTTP ${response.status}`);
+      }
+
+      let generatedImage: string | null = null;
+      let streamError: GenerationError | null = null;
+      await parseSseStream(
+        response,
+        (message) => {
+          const payload = extractPayload(message.data);
+          if (message.event === "status" || message.event === "heartbeat") {
+            setIdPhotoMessage(getTextFromPayload(payload, ["status", "message", "detail"]) || "正在生成证件照…");
+            return;
+          }
+          if (message.event === "partial_image") {
+            const image = getImageFromPayload(payload);
+            if (image) setIdPhotoPartial(image);
+            setIdPhotoMessage("已收到阶段性预览，正在生成最终证件照…");
+            return;
+          }
+          if (message.event === "final_image" || message.event === "done") {
+            const image = getImageFromPayload(payload);
+            if (image) generatedImage = image;
+            return;
+          }
+          if (message.event === "error") streamError = getGenerationErrorFromPayload(payload);
+        },
+        controller.signal,
+      );
+
+      if (streamError) throw new Error(streamError.detail || streamError.message);
+      if (!generatedImage) throw new Error("图片服务未返回证件照结果。");
+
+      const outputBlob = await createStandardIdPhotoBlob(generatedImage, spec);
+      const outputUrl = URL.createObjectURL(outputBlob);
+      if (idPhotoOutputUrlRef.current) URL.revokeObjectURL(idPhotoOutputUrlRef.current);
+      idPhotoOutputUrlRef.current = outputUrl;
+      setIdPhotoPartial(null);
+      setIdPhotoOutput({
+        name: createIdPhotoFileName(sourceFile.name, spec, background),
+        previewUrl: outputUrl,
+        size: outputBlob.size,
+      });
+      setIdPhotoMessage(`已生成 ${spec.label} ${background.label}证件照，并标准化为 ${spec.width} x ${spec.height}px PNG。`);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        setIdPhotoMessage("已取消证件照生成。");
+      } else {
+        setIdPhotoMessage(error instanceof Error ? error.message : "证件照生成失败。请更换正面清晰的原图后重试。");
+      }
+    } finally {
+      if (idPhotoAbortRef.current === controller) idPhotoAbortRef.current = null;
+      setIsIdPhotoProcessing(false);
+    }
   };
 
   const convertTransparentImage = async (file: File) => {
@@ -1558,7 +1583,7 @@ export default function App() {
     setPartialImage(null);
     setFinalImage(entry.image);
     setState("success");
-    setErrorMessage("");
+    setGenerationError(null);
     setRefinementMessage("");
     setStatus("已从本地历史恢复结果，可以继续追加生成或使用图片工具。");
     setHistoryMessage(`已恢复 ${formatHistoryTime(entry.createdAt)} 的结果。`);
@@ -1724,11 +1749,11 @@ export default function App() {
     }
 
     if (message.event === "error") {
-      const errorMessage = getTextFromPayload(payload, ["error", "message", "detail"]) || "图片生成流连接失败";
-      setErrorMessage(errorMessage);
-      setStatus("生成失败，请调整输入后重试。");
+      const nextError = getGenerationErrorFromPayload(payload);
+      setGenerationError(nextError);
+      setStatus(nextError.retryable ? "图片服务暂时繁忙，请稍后重试。" : "生成失败，请检查输入后重试。");
       setState("error");
-      return { errorMessage };
+      return { generationError: nextError };
     }
 
     return {};
@@ -1748,18 +1773,13 @@ export default function App() {
     abortRef.current = controller;
     setState("generating");
     setElapsed(0);
-    setErrorMessage("");
+    setGenerationError(null);
     setPartialImage(null);
     setFinalImage(null);
     setHeartbeatAt(null);
     setLightboxImage(null);
     setRefinementMessage("");
     setResultActionMessage("");
-    localEditAbortRef.current?.abort();
-    setIsLocalEditMode(false);
-    setLocalEditPreview(null);
-    setLocalEditMessage("");
-    setIsLocalEditing(false);
     setStatus(initialStatus);
     historyRequestRef.current = { prompt: historyPrompt, size, hasStoredImage: false };
 
@@ -1773,23 +1793,21 @@ export default function App() {
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) {
         let sawSuccessfulFinalOrDoneImage = false;
-        let bestSseErrorMessage = "";
+        let bestSseError: GenerationError | null = null;
 
         await parseSseStream(
           response,
           (message) => {
             const result = handleSseMessage(message);
             if (result.successfulImage) sawSuccessfulFinalOrDoneImage = true;
-            if (result.errorMessage) {
-              bestSseErrorMessage = result.errorMessage;
-              throw new Error(result.errorMessage);
-            }
+            if (result.generationError) bestSseError = result.generationError;
           },
           controller.signal,
         );
 
         if (!sawSuccessfulFinalOrDoneImage) {
-          throw new Error(!response.ok && bestSseErrorMessage ? bestSseErrorMessage : "图片生成流连接失败");
+          if (bestSseError) return false;
+          throw new Error("图片生成流连接失败");
         }
 
         setState((current) => (current === "generating" ? "success" : current));
@@ -1811,9 +1829,10 @@ export default function App() {
         setStatus("已取消当前请求。你可以随时重新生成。");
         return false;
       }
+      const message = error instanceof Error ? error.message : "未知错误";
       setState("error");
       setStatus("生成失败，请检查输入或稍后重试。");
-      setErrorMessage(error instanceof Error ? error.message : "未知错误");
+      setGenerationError({ message });
       return false;
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
@@ -1845,7 +1864,7 @@ export default function App() {
 
     try {
       const generatedImageFile = await createImageFileFromSource(finalImage);
-      const refinementRequest = createRefinementPrompt(prompt, nextPrompt);
+      const refinementRequest = createRefinementPrompt(nextPrompt);
       const formData = createImageFormData(refinementRequest, size, [generatedImageFile]);
       const isSuccessful = await runImageRequest(formData, "正在基于当前最终图追加生成…", refinementRequest);
 
@@ -1854,324 +1873,19 @@ export default function App() {
         setRefinementMessage("已根据追加提示词生成新图片。");
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : "追加生成失败";
       setState("error");
-      setErrorMessage(error instanceof Error ? error.message : "追加生成失败");
-      setRefinementMessage(error instanceof Error ? error.message : "追加生成失败");
+      setGenerationError({ message });
+      setRefinementMessage(message);
       setStatus("追加生成失败，请稍后重试。");
     }
   };
 
-  const startLocalEdit = (message: string) => {
-    const firstRegion: LocalEditRegion = {
-      id: crypto.randomUUID(),
-      selection: DEFAULT_LOCAL_EDIT_SELECTION,
-      prompt: "",
-      status: "draft",
-      message: "等待填写修改要求",
-    };
-    setIsLocalEditMode(true);
-    setLocalEditRegions([firstRegion]);
-    setActiveLocalEditRegionId(firstRegion.id);
-    setLocalEditImageSize(null);
-    setLocalEditPreview(null);
-    setLocalEditPreviewRegionIds([]);
-    setLocalEditMessage(message);
-  };
-
-  const openLocalEdit = () => {
-    if (!finalImage) return;
-    if (localEditStandaloneSourceUrlRef.current) URL.revokeObjectURL(localEditStandaloneSourceUrlRef.current);
-    localEditStandaloneSourceUrlRef.current = null;
-    setLocalEditStandaloneSource(null);
-    startLocalEdit("新增区域后，为每个区域分别填写修改要求。生成时仅上传对应区域及少量边缘上下文。");
-  };
-
-  const handleLocalEditStandaloneFile = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0] ?? null;
-    event.target.value = "";
-    if (!file) return;
-
-    if (!ALLOWED_TYPES.has(file.type)) {
-      setLocalEditMessage(`${file.name} 不是支持的 PNG、JPG 或 WebP 图片。`);
-      return;
-    }
-
-    if (file.size > MAX_TOOL_FILE_SIZE) {
-      setLocalEditMessage(`${file.name} 超过 ${formatBytes(MAX_TOOL_FILE_SIZE)}。`);
-      return;
-    }
-
-    const sourceUrl = URL.createObjectURL(file);
-    if (localEditStandaloneSourceUrlRef.current) URL.revokeObjectURL(localEditStandaloneSourceUrlRef.current);
-    localEditStandaloneSourceUrlRef.current = sourceUrl;
-    setLocalEditStandaloneSource({ name: file.name, previewUrl: sourceUrl, size: file.size });
-    startLocalEdit("已载入本地图片。框选一个或多个区域，分别填写修改要求后即可生成。");
-  };
-
-  const closeLocalEdit = () => {
-    localEditAbortRef.current?.abort();
-    localEditAbortRef.current = null;
-    localEditDragRef.current = null;
-    setIsLocalEditing(false);
-    setIsLocalEditMode(false);
-    setLocalEditRegions([]);
-    setActiveLocalEditRegionId(null);
-    setLocalEditImageSize(null);
-    setLocalEditPreview(null);
-    setLocalEditPreviewRegionIds([]);
-    setLocalEditMessage("");
-  };
-
-  const resumeStandaloneLocalEdit = () => {
-    if (!localEditStandaloneSource) return;
-    startLocalEdit("已重新打开本地图片。框选一个或多个区域，分别填写修改要求后即可生成。");
-  };
-
-  const localEditSource = localEditStandaloneSource?.previewUrl ?? finalImage;
-
-  useEffect(() => {
-    if (!isLocalEditMode || !localEditSource) return undefined;
-    let isMounted = true;
-
-    void createImageFileFromSource(localEditSource)
-      .then(loadImageElement)
-      .then((image) => {
-        if (isMounted) setLocalEditImageSize({ width: image.naturalWidth, height: image.naturalHeight });
-      })
-      .catch(() => {
-        if (isMounted) setLocalEditImageSize(null);
-      });
-
-    return () => {
-      isMounted = false;
-    };
-  }, [localEditSource, isLocalEditMode]);
-
-  const invalidateLocalEditPreview = () => {
-    setLocalEditPreview(null);
-    setLocalEditPreviewRegionIds([]);
-    setLocalEditRegions((current) => current.map((region) => region.status === "ready" ? { ...region, status: "draft", message: "区域已变更，需重新生成" } : region));
-  };
-
-  const updateLocalEditRegion = (id: string, update: Partial<Omit<LocalEditRegion, "id">>) => {
-    invalidateLocalEditPreview();
-    setLocalEditRegions((current) => current.map((region) => region.id === id ? { ...region, ...update, status: "draft", message: "等待生成" } : region));
-  };
-
-  const addLocalEditRegion = (selection = DEFAULT_LOCAL_EDIT_SELECTION) => {
-    const region: LocalEditRegion = {
-      id: crypto.randomUUID(),
-      selection,
-      prompt: "",
-      status: "draft",
-      message: "等待填写修改要求",
-    };
-    invalidateLocalEditPreview();
-    setLocalEditRegions((current) => [...current, region]);
-    setActiveLocalEditRegionId(region.id);
-    setLocalEditMessage("已新增区域。请填写该区域的修改要求。");
-  };
-
-  const removeLocalEditRegion = (id: string) => {
-    if (isLocalEditing) return;
-    invalidateLocalEditPreview();
-    setLocalEditRegions((current) => {
-      const next = current.filter((region) => region.id !== id);
-      setActiveLocalEditRegionId((active) => active === id ? next[0]?.id ?? null : active);
-      return next;
-    });
-  };
-
-  const moveLocalEditRegion = (id: string, direction: -1 | 1) => {
-    if (isLocalEditing) return;
-    invalidateLocalEditPreview();
-    setLocalEditRegions((current) => {
-      const index = current.findIndex((region) => region.id === id);
-      const target = index + direction;
-      if (index < 0 || target < 0 || target >= current.length) return current;
-      const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  };
-
-  const getLocalEditRegionSelection = (id: string) => localEditRegions.find((region) => region.id === id)?.selection ?? DEFAULT_LOCAL_EDIT_SELECTION;
-
-  const getLocalEditPoint = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const bounds = event.currentTarget.getBoundingClientRect();
-    return {
-      x: clampNumber(((event.clientX - bounds.left) / bounds.width) * 100, 0, 100),
-      y: clampNumber(((event.clientY - bounds.top) / bounds.height) * 100, 0, 100),
-    };
-  };
-
-  const handleLocalEditPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (isLocalEditing) return;
-    const point = getLocalEditPoint(event);
-    const regionId = (event.target as HTMLElement).closest<HTMLElement>("[data-local-region]")?.dataset.localRegion;
-    const handle = (event.target as HTMLElement).closest<HTMLElement>("[data-local-handle]")?.dataset.localHandle;
-    const isSelection = Boolean((event.target as HTMLElement).closest("[data-local-selection]"));
-    const mode = handle === "nw" || handle === "ne" || handle === "sw" || handle === "se" ? handle : isSelection ? "move" : "create";
-    const nextRegionId = regionId ?? crypto.randomUUID();
-    const selection = regionId ? getLocalEditRegionSelection(regionId) : createLocalEditSelection(point, point);
-
-    if (!regionId) {
-      invalidateLocalEditPreview();
-      setLocalEditRegions((current) => [...current, { id: nextRegionId, selection, prompt: "", status: "draft", message: "等待填写修改要求" }]);
-    } else {
-      invalidateLocalEditPreview();
-    }
-
-    event.currentTarget.setPointerCapture(event.pointerId);
-    localEditDragRef.current = { pointerId: event.pointerId, regionId: nextRegionId, mode, startPoint: point, selection };
-    setActiveLocalEditRegionId(nextRegionId);
-  };
-
-  const handleLocalEditPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = localEditDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    const point = getLocalEditPoint(event);
-    let nextSelection: LocalEditSelection;
-
-    if (drag.mode === "create") {
-      nextSelection = createLocalEditSelection(drag.startPoint, point);
-    } else if (drag.mode === "move") {
-      const offsetX = point.x - drag.startPoint.x;
-      const offsetY = point.y - drag.startPoint.y;
-      nextSelection = {
-        ...drag.selection,
-        x: clampNumber(drag.selection.x + offsetX, 0, 100 - drag.selection.width),
-        y: clampNumber(drag.selection.y + offsetY, 0, 100 - drag.selection.height),
-      };
-    } else {
-      const left = drag.mode.includes("w") ? point.x : drag.selection.x;
-      const top = drag.mode.includes("n") ? point.y : drag.selection.y;
-      const right = drag.mode.includes("e") ? point.x : drag.selection.x + drag.selection.width;
-      const bottom = drag.mode.includes("s") ? point.y : drag.selection.y + drag.selection.height;
-      nextSelection = createLocalEditSelection({ x: left, y: top }, { x: right, y: bottom });
-    }
-
-    event.preventDefault();
-    setLocalEditRegions((current) => current.map((region) => region.id === drag.regionId ? { ...region, selection: nextSelection, status: "draft", message: "选区已更新" } : region));
-  };
-
-  const handleLocalEditPointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    if (localEditDragRef.current?.pointerId === event.pointerId) {
-      localEditDragRef.current = null;
-      setLocalEditMessage("选区已更新。生成时只会上传对应区域及少量边缘上下文。");
-    }
-  };
-
-  const runLocalEditRegions = async (requestedRegionIds: string[]) => {
-    const sourceImage = localEditSource;
-    let processingRegionId: string | null = null;
-    if (!sourceImage || isLocalEditing) return;
-    const requestedRegions = localEditRegions.filter((region) => requestedRegionIds.includes(region.id));
-    if (!requestedRegions.length) {
-      setLocalEditMessage("请先新增并选中至少一个区域。");
-      return;
-    }
-
-    const missingPrompt = requestedRegions.find((region) => !region.prompt.trim());
-    if (missingPrompt) {
-      setActiveLocalEditRegionId(missingPrompt.id);
-      setLocalEditMessage("每个待生成区域都需要填写独立的修改要求。");
-      return;
-    }
-
-    try {
-      setIsLocalEditing(true);
-      invalidateLocalEditPreview();
-      localEditAbortRef.current?.abort();
-      const controller = new AbortController();
-      localEditAbortRef.current = controller;
-      let composite = sourceImage;
-
-      for (const [index, region] of requestedRegions.entries()) {
-        processingRegionId = region.id;
-        setActiveLocalEditRegionId(region.id);
-        setLocalEditRegions((current) => current.map((item) => item.id === region.id ? { ...item, status: "processing", message: "正在生成" } : item));
-        setLocalEditMessage(`正在生成区域 ${index + 1}/${requestedRegions.length}，仅上传该区域的局部裁剪图…`);
-        const { job, cropFile, maskFile } = await createLocalEditJob(composite, region.selection);
-        const formData = createImageFormData(createLocalEditPrompt(region.prompt), job.modelSize, [cropFile], maskFile);
-        const response = await fetch(API_ENDPOINT, { method: "POST", body: formData, signal: controller.signal });
-        const contentType = response.headers.get("content-type") ?? "";
-        if (!contentType.includes("text/event-stream")) {
-          const text = await response.text();
-          throw new Error(text || `区域 ${index + 1} 请求失败：HTTP ${response.status}`);
-        }
-
-        let generatedImage: string | null = null;
-        await parseSseStream(
-          response,
-          (message) => {
-            const payload = extractPayload(message.data);
-            if (message.event === "status") {
-              setLocalEditMessage(`区域 ${index + 1}/${requestedRegions.length}：${getTextFromPayload(payload, ["status", "message", "detail"]) || "正在生成局部结果…"}`);
-              return;
-            }
-            if (message.event === "final_image" || message.event === "done") {
-              const image = getImageFromPayload(payload);
-              if (image) generatedImage = image;
-              return;
-            }
-            if (message.event === "error") {
-              throw new Error(getTextFromPayload(payload, ["error", "message", "detail"]) || `区域 ${index + 1} 编辑失败。`);
-            }
-          },
-          controller.signal,
-        );
-
-        if (!generatedImage) throw new Error(`区域 ${index + 1} 未返回图片结果。`);
-        composite = await createLocalEditComposite(job, generatedImage);
-        setLocalEditRegions((current) => current.map((item) => item.id === region.id ? { ...item, status: "ready", message: "候选结果已合成" } : item));
-      }
-
-      setLocalEditPreview(composite);
-      setLocalEditPreviewRegionIds(requestedRegions.map((region) => region.id));
-      setLocalEditMessage(`已完成 ${requestedRegions.length} 个区域的候选合成。确认后才会替换当前最终图。`);
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        if (processingRegionId) {
-          setLocalEditRegions((current) => current.map((region) => region.id === processingRegionId ? { ...region, status: "draft", message: "已取消，等待重新生成" } : region));
-        }
-        setLocalEditMessage("已取消局部编辑。");
-      } else {
-        if (processingRegionId) setLocalEditRegions((current) => current.map((region) => region.id === processingRegionId ? { ...region, status: "error", message: error instanceof Error ? error.message : "生成失败" } : region));
-        setLocalEditMessage(error instanceof Error ? error.message : "局部图片编辑失败。");
-      }
-    } finally {
-      setIsLocalEditing(false);
-      localEditAbortRef.current = null;
-    }
-  };
-
-  const applyLocalEdit = () => {
-    if (!localEditPreview) return;
-    const appliedPrompts = localEditRegions.filter((region) => localEditPreviewRegionIds.includes(region.id)).map((region) => region.prompt.trim()).filter(Boolean);
-    if (localEditStandaloneSource) {
-      if (localEditStandaloneSourceUrlRef.current) URL.revokeObjectURL(localEditStandaloneSourceUrlRef.current);
-      localEditStandaloneSourceUrlRef.current = null;
-      setLocalEditStandaloneSource({ name: localEditStandaloneSource.name, previewUrl: localEditPreview });
-    } else {
-      historyRequestRef.current = { prompt: `局部修改：${appliedPrompts.join("；")}`, size, hasStoredImage: false };
-      setFinalImage(localEditPreview);
-      recordFinalImage(localEditPreview);
-    }
-    setLocalEditPreview(null);
-    setLocalEditRegions((current) => current.map((region) => localEditPreviewRegionIds.includes(region.id) ? { ...region, status: "applied", message: "已应用到原图" } : region));
-    setLocalEditPreviewRegionIds([]);
-    setLocalEditMessage("已应用候选合成图。可以继续新增区域修改其他位置。");
-    if (!localEditStandaloneSource) setResultActionMessage("局部修改已合成到当前最终图。");
-  };
-
-  const canSubmit = state !== "generating" && !isLocalEditing;
   const isGenerating = state === "generating";
+  const canSubmit = Boolean(prompt.trim()) && prompt.length <= MAX_PROMPT_LENGTH && !isGenerating;
   const visibleResult = finalImage ?? partialImage;
-  const canRefine = Boolean(finalImage && refinementPrompt.trim()) && !isGenerating;
+  const canRefine = Boolean(finalImage && refinementPrompt.trim()) && refinementPrompt.length <= MAX_REFINEMENT_PROMPT_LENGTH && !isGenerating;
   const isToolsPage = location.pathname === "/tools";
-  const isLocalEditStandalone = Boolean(isLocalEditMode && localEditStandaloneSource);
   const adjustLightboxZoom = (amount: number) => {
     updateLightboxZoom(lightboxZoomValueRef.current + amount);
   };
@@ -2237,7 +1951,7 @@ export default function App() {
   };
 
   return (
-    <main className={`app-shell ${isToolsPage ? "page-tools" : "page-generator"} ${isLocalEditStandalone ? "is-local-edit-standalone" : ""}`}>
+    <main className={`app-shell ${isToolsPage ? "page-tools" : "page-generator"}`}>
       <header className="app-topbar">
         <NavLink className="app-brand" to="/generator" aria-label="前往图片生成">
           <span className="app-brand-mark" aria-hidden="true" />
@@ -2259,7 +1973,7 @@ export default function App() {
               <span>01</span>
               <div>
                 <h2>配置输入</h2>
-                <p>参考图每张不超过 20MB。</p>
+                <p>最多 4 张参考图，每张 20MB，合计不超过 40MB。</p>
               </div>
             </div>
 
@@ -2273,6 +1987,8 @@ export default function App() {
               onPaste={handlePromptPaste}
               placeholder="描述画面、风格、材质、构图或任何限制条件…"
               rows={6}
+              required
+              maxLength={MAX_PROMPT_LENGTH}
               disabled={isGenerating}
             />
 
@@ -2290,7 +2006,7 @@ export default function App() {
             <label className={`upload-zone ${isGenerating ? "is-disabled" : ""}`} htmlFor="images">
               <input id="images" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleFiles} disabled={isGenerating} />
               <span>可选：上传或粘贴参考图</span>
-              <strong>不上传也能直接生成 · 可多选参考图</strong>
+              <strong>不上传直接生成 · 最多 4 张 / 单张 20MB / 合计 40MB</strong>
             </label>
             {validationMessage && <p className="validation-message" aria-live="polite">{validationMessage}</p>}
 
@@ -2329,27 +2045,83 @@ export default function App() {
           </form>
 
           <div className="toolkit" aria-label="本地图片与 PDF 工具">
-          <section className="panel local-edit-tool-panel">
+          <section className="panel id-photo-panel">
             <div className="panel-heading">
               <span>03</span>
               <div>
-                <h2>多区域局部修改</h2>
-                <p>上传任意图片即可框选多个区域并分别修改，不需要先生成图片。</p>
+                <h2>证件照制作</h2>
+                <p>保留人物与服装，自动换底并导出标准像素尺寸。</p>
               </div>
             </div>
 
-            <label className={`upload-zone ${isLocalEditing ? "is-disabled" : ""}`} htmlFor="local-edit-image">
-              <input id="local-edit-image" type="file" accept="image/png,image/jpeg,image/webp" onChange={handleLocalEditStandaloneFile} disabled={isLocalEditing} />
-              <span>选择要局部修改的图片</span>
-              <strong>支持 PNG、JPG、WebP，单张不超过 50MB。</strong>
+            <label className={`upload-zone ${isIdPhotoProcessing ? "is-disabled" : ""}`} htmlFor="id-photo-image">
+              <input id="id-photo-image" type="file" accept="image/png,image/jpeg,image/webp" onChange={handleIdPhotoFile} disabled={isIdPhotoProcessing} />
+              <span>选择正面清晰的人像</span>
+              <strong>支持 PNG、JPG、WebP，单张不超过 20MB。</strong>
             </label>
 
-            {localEditStandaloneSource && !isLocalEditMode && (
-              <div className="form-actions">
-                <button className="primary-button" type="button" onClick={resumeStandaloneLocalEdit}>继续编辑</button>
+            <div className="id-photo-options">
+              <label className="field-label" htmlFor="id-photo-spec">照片规格</label>
+              <select id="id-photo-spec" value={idPhotoSpecId} onChange={(event) => setIdPhotoSpecId(event.target.value)} disabled={isIdPhotoProcessing}>
+                {ID_PHOTO_SPECS.map((spec) => (
+                  <option key={spec.id} value={spec.id}>{spec.label} · {spec.width} x {spec.height}px · {spec.millimeters}</option>
+                ))}
+              </select>
+
+              <fieldset className="id-photo-backgrounds" disabled={isIdPhotoProcessing}>
+                <legend>背景颜色</legend>
+                <div>
+                  {ID_PHOTO_BACKGROUNDS.map((background) => (
+                    <button
+                      className={`id-photo-background ${idPhotoBackgroundId === background.id ? "is-active" : ""}`}
+                      type="button"
+                      key={background.id}
+                      onClick={() => setIdPhotoBackgroundId(background.id)}
+                      aria-pressed={idPhotoBackgroundId === background.id}
+                    >
+                      <span style={{ backgroundColor: background.color }} aria-hidden="true" />
+                      {background.label}
+                    </button>
+                  ))}
+                </div>
+              </fieldset>
+            </div>
+
+            <div className="form-actions">
+              <button className="primary-button" type="button" onClick={() => void createIdPhoto()} disabled={!idPhotoSource || isIdPhotoProcessing}>
+                {isIdPhotoProcessing ? "正在生成…" : "生成证件照"}
+              </button>
+              {isIdPhotoProcessing && <button className="secondary-button" type="button" onClick={() => idPhotoAbortRef.current?.abort()}>取消</button>}
+            </div>
+
+            {idPhotoMessage && <p className="validation-message" aria-live="polite">{idPhotoMessage}</p>}
+
+            {(idPhotoSource || idPhotoPartial || idPhotoOutput) && (
+              <div className="transparent-preview-grid id-photo-preview-grid">
+                {idPhotoSource && (
+                  <article className="transparent-preview-card">
+                    <span>原图</span>
+                    <button type="button" onClick={() => setLightboxImage({ src: idPhotoSource.previewUrl, alt: idPhotoSource.name })} aria-label={`放大查看 ${idPhotoSource.name}`}>
+                      <img src={idPhotoSource.previewUrl} alt={`${idPhotoSource.name} 原图`} />
+                    </button>
+                    <strong title={idPhotoSource.name}>{idPhotoSource.name}</strong>
+                    {idPhotoSource.size && <small>{formatBytes(idPhotoSource.size)}</small>}
+                  </article>
+                )}
+
+                {(idPhotoPartial || idPhotoOutput) && (
+                  <article className="transparent-preview-card">
+                    <span>{idPhotoOutput ? "成品" : "生成预览"}</span>
+                    <button type="button" onClick={() => setLightboxImage({ src: idPhotoOutput?.previewUrl ?? idPhotoPartial ?? "", alt: idPhotoOutput?.name ?? "证件照生成预览" })} aria-label="放大查看证件照">
+                      <img src={idPhotoOutput?.previewUrl ?? idPhotoPartial ?? ""} alt={idPhotoOutput ? "证件照成品" : "证件照生成预览"} />
+                    </button>
+                    <strong title={idPhotoOutput?.name}>{idPhotoOutput?.name ?? "正在生成"}</strong>
+                    {idPhotoOutput?.size && <small>{formatBytes(idPhotoOutput.size)}</small>}
+                    {idPhotoOutput && <a className="download-button" href={idPhotoOutput.previewUrl} download={idPhotoOutput.name}>下载 PNG</a>}
+                  </article>
+                )}
               </div>
             )}
-            {localEditMessage && !isLocalEditMode && <p className="validation-message" aria-live="polite">{localEditMessage}</p>}
           </section>
 
           <section className="panel border-trim-panel">
@@ -2646,127 +2418,22 @@ export default function App() {
             </p>
           )}
 
-          {errorMessage && (
+          {generationError && (
             <div className="error-box" role="alert">
               <strong>生成遇到问题</strong>
-              <p>{errorMessage}</p>
-              <span>你可以保留当前输入，调整后再次点击“开始生成”。</span>
+              <p>{generationError.message}</p>
+              {generationError.detail && generationError.detail !== generationError.message && (
+                <span className="error-detail">服务返回：{generationError.detail}</span>
+              )}
+              <span>{generationError.retryable ? "当前输入已保留，请稍后再次点击“开始生成”。" : "你可以保留当前输入，调整后再次点击“开始生成”。"}</span>
+              {generationError.requestId && <small>请求 ID：{generationError.requestId}</small>}
             </div>
           )}
 
-          {localEditSource && isLocalEditMode ? (
-            <section className="local-edit-workspace" aria-labelledby="local-edit-heading">
-              <div className="local-edit-canvas-shell">
-                <div className="local-edit-canvas" onPointerDown={handleLocalEditPointerDown} onPointerMove={handleLocalEditPointerMove} onPointerUp={handleLocalEditPointerEnd} onPointerCancel={handleLocalEditPointerEnd}>
-                  <img src={localEditSource} alt="当前局部编辑原图" draggable={false} />
-                  {localEditRegions.map((region, index) => (
-                    <div
-                      className={`local-edit-selection ${activeLocalEditRegionId === region.id ? "is-active" : ""}`}
-                      key={region.id}
-                      data-local-selection
-                      data-local-region={region.id}
-                      style={{ left: `${region.selection.x}%`, top: `${region.selection.y}%`, width: `${region.selection.width}%`, height: `${region.selection.height}%` }}
-                    >
-                      <strong>{index + 1}</strong>
-                      {activeLocalEditRegionId === region.id && (
-                        <>
-                          <span className="local-edit-handle is-nw" data-local-handle="nw" aria-hidden="true" />
-                          <span className="local-edit-handle is-ne" data-local-handle="ne" aria-hidden="true" />
-                          <span className="local-edit-handle is-sw" data-local-handle="sw" aria-hidden="true" />
-                          <span className="local-edit-handle is-se" data-local-handle="se" aria-hidden="true" />
-                        </>
-                      )}
-                    </div>
-                  ))}
-                </div>
-                <span>多区域局部编辑</span>
-              </div>
-
-              <aside className="local-edit-sidebar">
-                <div className="local-edit-heading">
-                  <div>
-                    <h3 id="local-edit-heading">局部修改队列</h3>
-                    <p>每个区域独立生成，按列表顺序合成。只上传对应的小图和边缘上下文。</p>
-                  </div>
-                  <button className="secondary-button" type="button" onClick={() => addLocalEditRegion()} disabled={isLocalEditing}>新增区域</button>
-                </div>
-
-                <div className="local-edit-source-meta">
-                  <span>原图尺寸</span>
-                  <strong>{localEditImageSize ? `${localEditImageSize.width} x ${localEditImageSize.height}px` : "读取中…"}</strong>
-                </div>
-
-                <div className="local-edit-region-list" aria-label="局部修改区域列表">
-                  {localEditRegions.map((region, index) => {
-                    const isActive = activeLocalEditRegionId === region.id;
-                    const pixelX = localEditImageSize ? Math.round((region.selection.x / 100) * localEditImageSize.width) : null;
-                    const pixelY = localEditImageSize ? Math.round((region.selection.y / 100) * localEditImageSize.height) : null;
-                    const pixelWidth = localEditImageSize ? Math.round((region.selection.width / 100) * localEditImageSize.width) : null;
-                    const pixelHeight = localEditImageSize ? Math.round((region.selection.height / 100) * localEditImageSize.height) : null;
-
-                    return (
-                      <article className={`local-edit-region ${isActive ? "is-active" : ""}`} key={region.id} onClick={() => setActiveLocalEditRegionId(region.id)}>
-                        <div className="local-edit-region-header">
-                          <button className="local-edit-region-title" type="button" onClick={() => setActiveLocalEditRegionId(region.id)}>
-                            区域 {String(index + 1).padStart(2, "0")}
-                          </button>
-                          <span className={`local-edit-region-status is-${region.status}`}>{LOCAL_EDIT_STATUS_LABELS[region.status]}</span>
-                          <div className="local-edit-region-tools">
-                            <button type="button" onClick={(event) => { event.stopPropagation(); moveLocalEditRegion(region.id, -1); }} disabled={isLocalEditing || index === 0} aria-label={`区域 ${index + 1} 上移`} title="上移">↑</button>
-                            <button type="button" onClick={(event) => { event.stopPropagation(); moveLocalEditRegion(region.id, 1); }} disabled={isLocalEditing || index === localEditRegions.length - 1} aria-label={`区域 ${index + 1} 下移`} title="下移">↓</button>
-                            <button type="button" onClick={(event) => { event.stopPropagation(); removeLocalEditRegion(region.id); }} disabled={isLocalEditing} aria-label={`删除区域 ${index + 1}`} title="删除">×</button>
-                          </div>
-                        </div>
-
-                        <div className="local-edit-region-coordinates">
-                          <span>X {region.selection.x.toFixed(1)}% · Y {region.selection.y.toFixed(1)}%</span>
-                          <span>W {region.selection.width.toFixed(1)}% · H {region.selection.height.toFixed(1)}%</span>
-                          <small>{pixelX === null ? "正在读取原图尺寸" : `${pixelX}, ${pixelY} · ${pixelWidth} x ${pixelHeight}px`}</small>
-                        </div>
-
-                        <label className="field-label" htmlFor={`local-edit-prompt-${region.id}`}>修改要求</label>
-                        <textarea
-                          id={`local-edit-prompt-${region.id}`}
-                          value={region.prompt}
-                          onChange={(event) => updateLocalEditRegion(region.id, { prompt: event.target.value })}
-                          onFocus={() => setActiveLocalEditRegionId(region.id)}
-                          placeholder="例如：把这行字改成黑色，字体与排版不变"
-                          rows={3}
-                          disabled={isLocalEditing}
-                        />
-                        <p className="local-edit-region-message">{region.message}</p>
-                      </article>
-                    );
-                  })}
-                </div>
-
-                <div className="local-edit-actions">
-                  <button className="primary-button" type="button" onClick={() => void runLocalEditRegions(localEditRegions.map((region) => region.id))} disabled={isLocalEditing || localEditRegions.length === 0}>
-                    {isLocalEditing ? "正在生成区域…" : "生成全部"}
-                  </button>
-                  <button className="secondary-button" type="button" onClick={() => activeLocalEditRegionId && void runLocalEditRegions([activeLocalEditRegionId])} disabled={isLocalEditing || !activeLocalEditRegionId}>
-                    生成选中区域
-                  </button>
-                  {isLocalEditing && <button className="secondary-button" type="button" onClick={() => localEditAbortRef.current?.abort()}>取消</button>}
-                  {localEditPreview && <button className="secondary-button" type="button" onClick={applyLocalEdit}>应用候选结果</button>}
-                </div>
-
-                {localEditMessage && <p className="local-edit-message" aria-live="polite">{localEditMessage}</p>}
-                {localEditPreview && (
-                  <div className="local-edit-preview">
-                    <button type="button" onClick={() => setLightboxImage({ src: localEditPreview, alt: "局部修改候选结果" })} aria-label="放大查看局部修改候选结果">
-                      <img src={localEditPreview} alt="局部修改候选结果" />
-                    </button>
-                    <span>候选合成结果，确认后才会替换当前图。</span>
-                  </div>
-                )}
-              </aside>
-            </section>
-          ) : (
-            <div className={`image-stage ${visibleResult ? "has-image" : ""}`}>
-              {visibleResult ? (
-                <>
-                  {finalImage ? (
+          <div className={`image-stage ${visibleResult ? "has-image" : ""}`}>
+            {visibleResult ? (
+              <>
+                {finalImage ? (
                   <button
                     className="image-open-button"
                     type="button"
@@ -2786,18 +2453,14 @@ export default function App() {
                 <strong>等待图片事件</strong>
                 <p>收到 partial_image 时会先显示预览，final_image / done 后展示最终图。</p>
               </div>
-              )}
-            </div>
-          )}
+            )}
+          </div>
 
           {finalImage && (
             <>
               <div className="result-actions" aria-label="最终图片操作">
                 <button className="secondary-button" type="button" onClick={downloadFinalImage}>下载</button>
                 <button className="secondary-button" type="button" onClick={() => void copyFinalImage()}>复制</button>
-                <button className="secondary-button" type="button" onClick={isLocalEditMode ? closeLocalEdit : openLocalEdit} disabled={isLocalEditing}>
-                  {isLocalEditMode ? "退出局部修改" : "局部修改"}
-                </button>
                 <button className="secondary-button" type="button" onClick={() => void sendFinalImageToTool("transparent")}>转透明 PNG</button>
                 <button className="secondary-button" type="button" onClick={() => void sendFinalImageToTool("border")}>去边框</button>
                 <button className="secondary-button" type="button" onClick={() => void sendFinalImageToTool("compress")}>压缩</button>
@@ -2815,6 +2478,8 @@ export default function App() {
                   onChange={(event) => setRefinementPrompt(event.target.value)}
                   placeholder="例如：把背景换成纯白、整体更亮、保留人物姿势..."
                   rows={3}
+                  required
+                  maxLength={MAX_REFINEMENT_PROMPT_LENGTH}
                   disabled={isGenerating}
                 />
                 <div className="refine-actions">

@@ -81,13 +81,14 @@ function createSseResponse() {
   };
 }
 
-function createStreamContext(operation = "generate") {
+function createStreamContext(operation = "generate", model = "gpt-image-2.5-flare") {
   return {
     completed: false,
     failed: false,
     finalImage: "",
     operation,
     endpoint: getImagesApiPath(operation),
+    model,
     requestId: "request-test",
     metrics: { startedAt: 1000 },
     res: createSseResponse(),
@@ -251,17 +252,19 @@ test("isAllowedImageSize applies one rule to presets and custom sizes", () => {
   }
 });
 
-test("getImageStreamRequest defaults an omitted size to auto and ignores client mode", () => {
-  const noImage = getImageStreamRequest({ body: { prompt: " draw ", mode: "edit" } }, []);
+test("getImageStreamRequest defaults an omitted size to auto and accepts an allowed model", () => {
+  const noImage = getImageStreamRequest({ body: { prompt: " draw ", mode: "edit", model: "gpt-image-2.5-flare" } }, []);
   const image = createReferenceImage();
-  const withImage = getImageStreamRequest({ body: { prompt: "edit", mode: "generate", size: "2048x1152" } }, [image]);
+  const withImage = getImageStreamRequest({ body: { prompt: "edit", mode: "generate", model: "gpt-image-2", size: "2048x1152" } }, [image]);
 
   assert.strictEqual(noImage.size, "auto");
   assert.strictEqual(noImage.operation, "generate");
   assert.strictEqual(noImage.endpoint, "/v1/images/generations");
+  assert.strictEqual(noImage.model, "gpt-image-2.5-flare");
   assert.strictEqual(withImage.operation, "edit");
   assert.strictEqual(withImage.endpoint, "/v1/images/edits");
   assert.strictEqual(withImage.size, "2048x1152");
+  assert.strictEqual(withImage.model, "gpt-image-2");
   assert.strictEqual(withImage.totalImageBytes, image.size);
   assert.strictEqual(Object.hasOwn(noImage, "mode"), false);
 });
@@ -277,12 +280,23 @@ test("explicit invalid sizes produce a validation error instead of falling back"
   assert.match(getImageStreamValidationError(request), /输出尺寸不合法/);
 });
 
+test("unsupported image models are rejected before calling the upstream API", () => {
+  const request = getImageStreamRequest({ body: { prompt: "draw", model: "gpt-image-other" } }, []);
+  request.provider.apiKey = "key";
+  const error = validateImageStreamRequest(request);
+
+  assert.strictEqual(error.statusCode, 400);
+  assert.strictEqual(error.errorStage, "model");
+  assert.match(error.message, /图片模型不支持/);
+});
+
 test("image request validation checks prompt, size, and server configuration", () => {
   const valid = {
     referenceImages: [],
     operation: "generate",
     endpoint: "/v1/images/generations",
     prompt: "draw",
+    model: "gpt-image-2.5-flare",
     provider: { apiKey: "key", missingKeyEnv: "OPENAI_API_KEY" },
     requestedSize: "",
     size: "auto",
@@ -295,8 +309,8 @@ test("image request validation checks prompt, size, and server configuration", (
   assert.match(getImageStreamValidationError({ ...valid, provider: { apiKey: "", missingKeyEnv: "OPENAI_API_KEY" } }), /服务端缺少 OPENAI_API_KEY/);
 });
 
-test("generation payload targets gpt-image-2 directly with streaming", () => {
-  const payload = createImageGenerationPayload("draw", "1024x1024");
+test("generation payload targets the selected image model directly with streaming", () => {
+  const payload = createImageGenerationPayload("draw", "1024x1024", "gpt-image-2");
 
   assert.deepStrictEqual(payload, {
     model: "gpt-image-2",
@@ -309,18 +323,18 @@ test("generation payload targets gpt-image-2 directly with streaming", () => {
   assert.strictEqual(Object.hasOwn(payload, "input"), false);
 });
 
-test("edit form uses repeated image[] files and no client mode", () => {
+test("edit form uses repeated image[] files without upstream streaming", () => {
   const first = createReferenceImage(8, "image/png");
   const second = createReferenceImage(12, "image/webp");
-  const form = createImageEditFormData("edit", "1024x1024", [first, second]);
+  const form = createImageEditFormData("edit", "1024x1024", [first, second], "gpt-image-2");
   const entries = [...form.entries()];
   const imageEntries = entries.filter(([key]) => key === "image[]");
 
   assert.strictEqual(form.get("model"), "gpt-image-2");
   assert.strictEqual(form.get("prompt"), "edit");
   assert.strictEqual(form.get("size"), "1024x1024");
-  assert.strictEqual(form.get("stream"), "true");
-  assert.strictEqual(form.get("partial_images"), "1");
+  assert.strictEqual(form.get("stream"), "false");
+  assert.strictEqual(form.has("partial_images"), false);
   assert.strictEqual(form.has("mode"), false);
   assert.strictEqual(imageEntries.length, 2);
   assert.deepStrictEqual(imageEntries.map(([, file]) => file.name), ["reference-1.png", "reference-2.webp"]);
@@ -406,7 +420,7 @@ test("image request metrics contain only the approved non-sensitive fields", () 
     totalImageBytes: 1234,
     size: "1024x1024",
     endpoint: "/v1/images/edits",
-    model: "gpt-image-2",
+    model: "gpt-image-2.5-flare",
     upstreamConnectedAt: 1100,
     firstImageAt: 1200,
     completedAt: 1300,
@@ -617,6 +631,8 @@ test("frontend uses direct automatic operation selection and matching limits", (
   assert.match(appSource, /const MAX_REFERENCE_IMAGES = 4;/);
   assert.match(appSource, /const MAX_REFERENCE_TOTAL_SIZE = 40 \* 1024 \* 1024;/);
   assert.match(appSource, /const IMAGE_SIZE_OPTIONS = \["auto", "1024x1024", "1024x1536", "1536x1024", "2048x1152", "1152x2048"\];/);
+  assert.match(appSource, /const IMAGE_MODEL_OPTIONS = \["gpt-image-2\.5-flare", "gpt-image-2\.5-sunburst", "gpt-image-2"\];/);
+  assert.match(appSource, /formData\.append\("model", model \|\| DEFAULT_IMAGE_MODEL\)/);
   assert.doesNotMatch(appSource, /formData\.append\("mode"/);
   assert.doesNotMatch(appSource, /1920x1080/);
   assert.match(appSource, /required\s+maxLength=\{MAX_PROMPT_LENGTH\}/);
@@ -627,7 +643,7 @@ test("frontend uses direct automatic operation selection and matching limits", (
   assert.match(appSource, /if \(bestSseError\) return false;/);
   assert.match(appSource, /generationError\.detail/);
   assert.match(appSource, /请求 ID：\{generationError\.requestId\}/);
-  assert.match(appSource, /createImageFormData\(refinementRequest, size, \[generatedImageFile\]\)/);
+  assert.match(appSource, /createImageFormData\(refinementRequest, size, model, \[generatedImageFile\]\)/);
 });
 
 test("runtime and docs no longer route image requests through Responses API", () => {
@@ -646,5 +662,5 @@ test("frontend no longer exposes local image editing and keeps reference-image r
   assert.doesNotMatch(appSource, /local-edit/i);
   assert.doesNotMatch(appSource, /图片局部编辑|局部修改|input_image_mask|maskFile/);
   assert.match(appSource, /可选：上传或粘贴参考图/);
-  assert.match(appSource, /createImageFormData\(refinementRequest, size, \[generatedImageFile\]\)/);
+  assert.match(appSource, /createImageFormData\(refinementRequest, size, model, \[generatedImageFile\]\)/);
 });

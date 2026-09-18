@@ -43,7 +43,7 @@ npm run frontend:build
 | --- | --- | --- |
 | `OPENAI_API_KEY` | 图片服务 API 密钥，必填 | 无 |
 | `OPENAI_BASE_URL` | 兼容 OpenAI Images API 的服务地址 | `https://vibe.soyoung.com` |
-| `OPENAI_IMAGE_MODEL` | 图片生成和编辑模型 | `gpt-image-2` |
+| `OPENAI_IMAGE_MODEL` | 客户端未传模型时使用的默认图片模型 | `gpt-image-2.5-flare` |
 | `PORT` | 服务端端口 | `80` |
 | `CORS_ORIGIN` | 允许的跨域来源，逗号分隔 | 无 |
 | `IMAGE_RATE_LIMIT_PER_HOUR` | 单 IP 每小时生成次数，`0` 关闭限流 | `20` |
@@ -55,7 +55,8 @@ npm run frontend:build
 
 - `POST /v1/images/generations`：无参考图时文生图。
 - `POST /v1/images/edits`：有参考图或基于最终图追加修改。
-- `gpt-image-2`、Images API SSE，以及 `image[]` 多文件字段。
+- `gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，以及 `image[]` 多文件字段。
+- `/v1/images/generations` 使用上游流式响应并支持阶段性预览；`/v1/images/edits` 在当前兼容服务上使用非流式上游请求，完成后仍通过浏览器端 SSE 返回最终图片，避免 `stream=true` 长时间无响应。
 
 服务端不会在 Images API 不兼容时静默回退到其他接口，以免改变生成语义。更换兼容服务后应分别验证以上两个端点。
 
@@ -66,10 +67,11 @@ npm run frontend:build
 使用 `multipart/form-data` 传入：
 
 - `prompt`：必填，去除首尾空白后不能为空，最多 2000 个字符。
-- `size`：可省略，默认 `auto`；也可传 `gpt-image-2` 支持的 `WIDTHxHEIGHT`。除 `auto` 外，宽高必须都是 16 的倍数，比例在 1:3～3:1，最长边不超过 3840px，总像素为 655,360～8,294,400。
+- `model`：可省略，默认 `gpt-image-2.5-flare`；仅支持 `gpt-image-2`、`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`。
+- `size`：可省略，默认 `auto`；也可传已选图片模型支持的 `WIDTHxHEIGHT`。除 `auto` 外，宽高必须都是 16 的倍数，比例在 1:3～3:1，最长边不超过 3840px，总像素为 655,360～8,294,400。
 - `images`：可选的一个或多个参考图片。是否存在参考图就是服务端选择“生成”或“编辑”的唯一依据，不接受客户端 `mode`。
 
-浏览器接口始终返回 SSE，事件包括 `status`、`heartbeat`、`partial_image`、`final_image`、`done` 和 `error`。响应头 `X-Request-ID` 以及图片/错误事件中的 `requestId` 可用于定位请求。
+浏览器接口始终返回 SSE，事件包括 `status`、`heartbeat`、`partial_image`、`final_image`、`done` 和 `error`。无参考图时可以收到 `partial_image`；参考图编辑会在上游完成后收到 `final_image`。响应头 `X-Request-ID` 以及图片/错误事件中的 `requestId` 可用于定位请求。
 
 服务端会记录不含敏感内容的单行请求指标，例如操作类型、参考图数量与总字节数、尺寸、上游端点、模型、HTTP 状态和各阶段耗时。日志不会记录图片、Base64、完整提示词、API Key 或 Authorization。
 

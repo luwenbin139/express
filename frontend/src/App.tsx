@@ -99,6 +99,8 @@ const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const PDF_MIME_TYPE = "application/pdf";
 const DEFAULT_IMAGE_SIZE = "auto";
 const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "2048x1152", "1152x2048"];
+const DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare";
+const IMAGE_MODEL_OPTIONS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"];
 const ID_PHOTO_SPECS: IdPhotoSpec[] = [
   { id: "one-inch", label: "一寸", width: 295, height: 413, millimeters: "25 x 35 mm" },
   { id: "small-one-inch", label: "小一寸", width: 260, height: 378, millimeters: "22 x 32 mm" },
@@ -343,10 +345,11 @@ function getImageFromPayload(payload: unknown) {
   return null;
 }
 
-function createImageFormData(prompt: string, size: string, images: File[]) {
+function createImageFormData(prompt: string, size: string, model: string, images: File[]) {
   const formData = new FormData();
   formData.append("prompt", prompt);
   formData.append("size", size || DEFAULT_IMAGE_SIZE);
+  formData.append("model", model || DEFAULT_IMAGE_MODEL);
   images.forEach((image) => formData.append("images", image));
   return formData;
 }
@@ -876,6 +879,7 @@ export default function App() {
   const [refinementPrompt, setRefinementPrompt] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
   const [size, setSize] = useState(DEFAULT_IMAGE_SIZE);
+  const [model, setModel] = useState(DEFAULT_IMAGE_MODEL);
   const [validationMessage, setValidationMessage] = useState("");
   const [refinementMessage, setRefinementMessage] = useState("");
   const [state, setState] = useState<GenerationState>("idle");
@@ -1212,7 +1216,7 @@ export default function App() {
     try {
       const response = await fetch(API_ENDPOINT, {
         method: "POST",
-        body: createImageFormData(createIdPhotoPrompt(spec, background), "auto", [sourceFile]),
+        body: createImageFormData(createIdPhotoPrompt(spec, background), "auto", model, [sourceFile]),
         signal: controller.signal,
       });
       const contentType = response.headers.get("content-type") ?? "";
@@ -1842,7 +1846,7 @@ export default function App() {
   // 只调用流式接口；生成/编辑由是否上传参考图自动决定。
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const formData = createImageFormData(prompt, size, images.map((image) => image.file));
+    const formData = createImageFormData(prompt, size, model, images.map((image) => image.file));
     await runImageRequest(formData, "正在上传 multipart/form-data 到 /api/generate-image-stream…", prompt);
   };
 
@@ -1865,7 +1869,7 @@ export default function App() {
     try {
       const generatedImageFile = await createImageFileFromSource(finalImage);
       const refinementRequest = createRefinementPrompt(nextPrompt);
-      const formData = createImageFormData(refinementRequest, size, [generatedImageFile]);
+      const formData = createImageFormData(refinementRequest, size, model, [generatedImageFile]);
       const isSuccessful = await runImageRequest(formData, "正在基于当前最终图追加生成…", refinementRequest);
 
       if (isSuccessful) {
@@ -1991,6 +1995,17 @@ export default function App() {
               maxLength={MAX_PROMPT_LENGTH}
               disabled={isGenerating}
             />
+
+            <label className="field-label size-label" htmlFor="model">
+              图片模型
+            </label>
+            <select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={isGenerating}>
+              {IMAGE_MODEL_OPTIONS.map((option) => (
+                <option value={option} key={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
 
             <label className="field-label size-label" htmlFor="size">
               输出尺寸

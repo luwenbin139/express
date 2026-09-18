@@ -8,9 +8,11 @@ const cors = require("cors");
 const morgan = require("morgan");
 
 const logger = morgan("tiny");
-const imageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+const DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare";
+const imageModel = process.env.OPENAI_IMAGE_MODEL || DEFAULT_IMAGE_MODEL;
+const IMAGE_MODELS = new Set(["gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
 const CUSTOM_IMAGE_SIZE_PATTERN = /^(\d+)x(\d+)$/;
-const CUSTOM_IMAGE_MODELS = new Set(["gpt-image-2", "gpt-image-2-2026-04-21"]);
+const CUSTOM_IMAGE_MODELS = IMAGE_MODELS;
 const MIN_CUSTOM_IMAGE_PIXELS = 655_360;
 const MAX_CUSTOM_IMAGE_PIXELS = 8_294_400;
 const MAX_CUSTOM_IMAGE_EDGE = 3840;
@@ -24,6 +26,8 @@ const MAX_MULTIPART_BOUNDARY_OVERHEAD_BYTES = 512;
 const JSON_BODY_LIMIT = "60mb";
 const IMAGE_PARTIAL_COUNT = 1;
 const IMAGE_REQUEST_TIMEOUT_MS = 12 * 60 * 1000;
+// 当前兼容层的图片编辑接口在 stream=true 时可能一直不返回响应；编辑请求走非流式上游并设置更短的失败边界。
+const IMAGE_EDIT_REQUEST_TIMEOUT_MS = 3 * 60 * 1000;
 const DEFAULT_IMAGE_SIZE = "auto";
 const allowedUploadMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const imageDataUrlPattern = /^data:(image\/(png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
@@ -181,13 +185,13 @@ function getUploadTotalLimitMessage(maxTotalBytes = MAX_UPLOAD_TOTAL_BYTES) {
   return `参考图合计最大 ${Math.round(maxTotalBytes / (1024 * 1024))}MB`;
 }
 
-function isAllowedImageSize(value) {
+function isAllowedImageSize(value, model = imageModel) {
   if (value === "auto") {
     return true;
   }
 
   const match = typeof value === "string" ? value.match(CUSTOM_IMAGE_SIZE_PATTERN) : null;
-  if (!match || !CUSTOM_IMAGE_MODELS.has(imageModel)) {
+  if (!match || !CUSTOM_IMAGE_MODELS.has(model)) {
     return false;
   }
 
@@ -573,9 +577,9 @@ function getRequestImageInput(req) {
   return validateImageDataUrls(collectJsonImageDataUrls(req.body));
 }
 
-function createImageGenerationPayload(prompt, size) {
+function createImageGenerationPayload(prompt, size, model = imageModel) {
   return {
-    model: imageModel,
+    model,
     prompt,
     size,
     stream: true,
@@ -595,13 +599,16 @@ function getImageFileExtension(mimetype) {
   return "png";
 }
 
-function createImageEditFormData(prompt, size, images) {
+function createImageEditFormData(prompt, size, images, model = imageModel, stream = false) {
   const formData = new FormData();
-  formData.append("model", imageModel);
+  formData.append("model", model);
   formData.append("prompt", prompt);
   formData.append("size", size);
-  formData.append("stream", "true");
-  formData.append("partial_images", String(IMAGE_PARTIAL_COUNT));
+  formData.append("stream", String(stream));
+
+  if (stream) {
+    formData.append("partial_images", String(IMAGE_PARTIAL_COUNT));
+  }
 
   images.forEach((image, index) => {
     const blob = new Blob([image.buffer], { type: image.mimetype });
@@ -618,8 +625,10 @@ function getImagesApiPath(operation) {
 function getImageStreamRequest(req, referenceImages) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const rawSize = body.size;
+  const rawModel = body.model;
   const hasExplicitSize = rawSize !== undefined && rawSize !== null && rawSize !== "";
   const size = hasExplicitSize ? rawSize : DEFAULT_IMAGE_SIZE;
+  const model = typeof rawModel === "string" && rawModel.trim() ? rawModel.trim() : imageModel;
   const operation = referenceImages.length > 0 ? "edit" : "generate";
 
   return {
@@ -628,6 +637,7 @@ function getImageStreamRequest(req, referenceImages) {
     endpoint: getImagesApiPath(operation),
     prompt: typeof body.prompt === "string" ? body.prompt.trim() : "",
     provider: resolveImageProvider(),
+    model,
     requestedSize: hasExplicitSize ? rawSize : "",
     size,
     totalImageBytes: referenceImages.reduce((total, image) => total + image.size, 0),
@@ -651,7 +661,15 @@ function validateImageStreamRequest(request) {
     };
   }
 
-  if (!isAllowedImageSize(request.size)) {
+  if (!IMAGE_MODELS.has(request.model)) {
+    return {
+      message: "图片模型不支持，请选择 gpt-image-2、gpt-image-2.5-flare 或 gpt-image-2.5-sunburst",
+      statusCode: 400,
+      errorStage: "model",
+    };
+  }
+
+  if (!isAllowedImageSize(request.size, request.model)) {
     return {
       message: "输出尺寸不合法：宽高须为 16 的倍数，比例为 1:3～3:1，最长边不超过 3840px，总像素为 655360～8294400",
       statusCode: 400,
@@ -737,7 +755,7 @@ function getImageRequestId(req) {
 
 function getStreamImageMetadata(context) {
   return {
-    model: imageModel,
+    model: context.model,
     api: context.operation === "edit" ? "images_edit" : "images_generation",
     endpoint: context.endpoint,
     requestId: context.requestId,
@@ -983,7 +1001,7 @@ function enrichImageRequestMetrics(req, request) {
     totalImageBytes: request.totalImageBytes,
     size: request.size,
     endpoint: request.endpoint,
-    model: imageModel,
+    model: request.model,
   });
 }
 
@@ -994,6 +1012,7 @@ function createImagesStreamContext(request, res, metrics) {
     finalImage: "",
     operation: request.operation,
     endpoint: request.endpoint,
+    model: request.model,
     requestId: metrics && metrics.requestId ? metrics.requestId : "",
     metrics,
     res,
@@ -1055,10 +1074,11 @@ async function streamImagesApi(request, res, metrics) {
   const context = createImagesStreamContext(request, res, metrics);
   let timedOut = false;
   let clientClosed = false;
+  const requestTimeoutMs = request.operation === "edit" ? IMAGE_EDIT_REQUEST_TIMEOUT_MS : IMAGE_REQUEST_TIMEOUT_MS;
   const timeout = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, IMAGE_REQUEST_TIMEOUT_MS);
+  }, requestTimeoutMs);
   const closeUpstream = () => {
     clientClosed = true;
     controller.abort();
@@ -1078,9 +1098,9 @@ async function streamImagesApi(request, res, metrics) {
     let body;
 
     if (request.operation === "edit") {
-      body = createImageEditFormData(request.prompt, request.size, request.referenceImages);
+      body = createImageEditFormData(request.prompt, request.size, request.referenceImages, request.model);
     } else {
-      body = JSON.stringify(createImageGenerationPayload(request.prompt, request.size));
+      body = JSON.stringify(createImageGenerationPayload(request.prompt, request.size, request.model));
       headers["Content-Type"] = "application/json";
     }
 
@@ -1153,12 +1173,21 @@ async function streamImagesApi(request, res, metrics) {
       };
     }
 
+    const operationLabel = request.operation === "edit" ? "图片编辑" : "图片生成";
+    const causeCode = error && error.cause && typeof error.cause.code === "string" ? error.cause.code : "";
     const message = timedOut
-      ? "图片生成请求超时，请稍后重试"
-      : error instanceof Error && error.message
-        ? error.message
-        : "图片生成请求失败";
-    sendImagesStreamError(context, message);
+      ? `${operationLabel}请求超时（超过 ${Math.round(requestTimeoutMs / 60000)} 分钟），请稍后重试`
+      : causeCode
+        ? `无法连接${operationLabel}服务（${causeCode}），请检查服务地址或网络后重试`
+        : error instanceof Error && error.message === "fetch failed"
+          ? `无法连接${operationLabel}服务，请检查服务地址或网络后重试`
+          : error instanceof Error && error.message
+            ? error.message
+            : `${operationLabel}请求失败`;
+    sendImagesStreamError(context, message, {
+      ...(causeCode ? { errorCode: causeCode } : {}),
+      ...(timedOut || causeCode === "ECONNRESET" || causeCode === "ETIMEDOUT" ? { retryable: true } : {}),
+    });
     return {
       outcome: timedOut ? "timeout" : "upstream_error",
       httpStatus: timedOut ? 504 : 502,

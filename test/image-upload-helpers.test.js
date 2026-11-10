@@ -25,6 +25,8 @@ const {
   parseUpstreamImageError,
   getBadUpstreamImageError,
   getMaxUploadImages,
+  getImageModelCatalog,
+  IMAGE_MODEL_IDS,
   isAllowedImageSize,
   parseAllowedCorsOrigins,
   createCorsOptions,
@@ -255,7 +257,7 @@ test("isAllowedImageSize applies one rule to presets and custom sizes", () => {
 test("getImageStreamRequest defaults an omitted size to auto and accepts an allowed model", () => {
   const noImage = getImageStreamRequest({ body: { prompt: " draw ", mode: "edit", model: "gpt-image-2.5-flare" } }, []);
   const image = createReferenceImage();
-  const withImage = getImageStreamRequest({ body: { prompt: "edit", mode: "generate", model: "gpt-image-2", size: "2048x1152" } }, [image]);
+  const withImage = getImageStreamRequest({ body: { prompt: "edit", mode: "generate", model: "gpt-image-2.5-sunburst", size: "2048x1152" } }, [image]);
 
   assert.strictEqual(noImage.size, "auto");
   assert.strictEqual(noImage.operation, "generate");
@@ -264,7 +266,7 @@ test("getImageStreamRequest defaults an omitted size to auto and accepts an allo
   assert.strictEqual(withImage.operation, "edit");
   assert.strictEqual(withImage.endpoint, "/v1/images/edits");
   assert.strictEqual(withImage.size, "2048x1152");
-  assert.strictEqual(withImage.model, "gpt-image-2");
+  assert.strictEqual(withImage.model, "gpt-image-2.5-sunburst");
   assert.strictEqual(withImage.totalImageBytes, image.size);
   assert.strictEqual(Object.hasOwn(noImage, "mode"), false);
 });
@@ -310,10 +312,10 @@ test("image request validation checks prompt, size, and server configuration", (
 });
 
 test("generation payload targets the selected image model directly with streaming", () => {
-  const payload = createImageGenerationPayload("draw", "1024x1024", "gpt-image-2");
+  const payload = createImageGenerationPayload("draw", "1024x1024", "gpt-image-2.5-sunburst");
 
   assert.deepStrictEqual(payload, {
-    model: "gpt-image-2",
+    model: "gpt-image-2.5-sunburst",
     prompt: "draw",
     size: "1024x1024",
     stream: true,
@@ -326,11 +328,11 @@ test("generation payload targets the selected image model directly with streamin
 test("edit form uses repeated image[] files without upstream streaming", () => {
   const first = createReferenceImage(8, "image/png");
   const second = createReferenceImage(12, "image/webp");
-  const form = createImageEditFormData("edit", "1024x1024", [first, second], "gpt-image-2");
+  const form = createImageEditFormData("edit", "1024x1024", [first, second], "gpt-image-2.5-sunburst");
   const entries = [...form.entries()];
   const imageEntries = entries.filter(([key]) => key === "image[]");
 
-  assert.strictEqual(form.get("model"), "gpt-image-2");
+  assert.strictEqual(form.get("model"), "gpt-image-2.5-sunburst");
   assert.strictEqual(form.get("prompt"), "edit");
   assert.strictEqual(form.get("size"), "1024x1024");
   assert.strictEqual(form.get("stream"), "false");
@@ -631,8 +633,10 @@ test("frontend uses direct automatic operation selection and matching limits", (
   assert.match(appSource, /const MAX_REFERENCE_IMAGES = 4;/);
   assert.match(appSource, /const MAX_REFERENCE_TOTAL_SIZE = 40 \* 1024 \* 1024;/);
   assert.match(appSource, /const IMAGE_SIZE_OPTIONS = \["auto", "1024x1024", "1024x1536", "1536x1024", "2048x1152", "1152x2048"\];/);
-  assert.match(appSource, /const IMAGE_MODEL_OPTIONS = \["gpt-image-2\.5-flare", "gpt-image-2\.5-sunburst", "gpt-image-2"\];/);
-  assert.match(appSource, /formData\.append\("model", model \|\| DEFAULT_IMAGE_MODEL\)/);
+  assert.doesNotMatch(appSource, /DEFAULT_IMAGE_MODEL|IMAGE_MODEL_OPTIONS|gpt-image-2\.5-flare/);
+  assert.match(appSource, /const IMAGE_MODELS_ENDPOINT = "\/api\/image-models";/);
+  assert.match(appSource, /fetch\(IMAGE_MODELS_ENDPOINT/);
+  assert.match(appSource, /formData\.append\("model", model\)/);
   assert.doesNotMatch(appSource, /formData\.append\("mode"/);
   assert.doesNotMatch(appSource, /1920x1080/);
   assert.match(appSource, /required\s+maxLength=\{MAX_PROMPT_LENGTH\}/);
@@ -644,6 +648,25 @@ test("frontend uses direct automatic operation selection and matching limits", (
   assert.match(appSource, /generationError\.detail/);
   assert.match(appSource, /请求 ID：\{generationError\.requestId\}/);
   assert.match(appSource, /createImageFormData\(refinementRequest, size, model, \[generatedImageFile\]\)/);
+});
+
+test("image model catalog is exposed by the backend and fetched on page load", () => {
+  const catalog = getImageModelCatalog();
+
+  assert.deepStrictEqual(catalog.models, IMAGE_MODEL_IDS);
+  assert.notStrictEqual(catalog.models, IMAGE_MODEL_IDS);
+  assert.ok(catalog.models.length > 0);
+  assert.ok(catalog.models.every((id) => typeof id === "string" && id.trim().length > 0));
+  assert.ok(catalog.models.includes(catalog.defaultModel));
+
+  const serverSource = fs.readFileSync(path.join(__dirname, "../index.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(__dirname, "../frontend/src/App.tsx"), "utf8");
+
+  assert.match(serverSource, /app\.get\("\/api\/image-models"/);
+  assert.match(serverSource, /res\.json\(getImageModelCatalog\(\)\)/);
+  assert.match(appSource, /useState<"loading" \| "ready" \| "error">\("loading"\)/);
+  assert.match(appSource, /modelCatalogStatus === "ready"/);
+  assert.match(appSource, /setModelCatalogReloadKey\(\(key\) => key \+ 1\)/);
 });
 
 test("runtime and docs no longer route image requests through Responses API", () => {

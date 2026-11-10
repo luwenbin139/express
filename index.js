@@ -10,7 +10,9 @@ const morgan = require("morgan");
 const logger = morgan("tiny");
 const DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare";
 const imageModel = process.env.OPENAI_IMAGE_MODEL || DEFAULT_IMAGE_MODEL;
-const IMAGE_MODELS = new Set(["gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
+// 可用模型清单是唯一数据源：既用于请求校验，也通过 /api/image-models 暴露给前端。
+const IMAGE_MODEL_IDS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"];
+const IMAGE_MODELS = new Set(IMAGE_MODEL_IDS);
 const CUSTOM_IMAGE_SIZE_PATTERN = /^(\d+)x(\d+)$/;
 const CUSTOM_IMAGE_MODELS = IMAGE_MODELS;
 const MIN_CUSTOM_IMAGE_PIXELS = 655_360;
@@ -41,6 +43,13 @@ function getMaxUploadImages(value) {
   }
 
   return parsed;
+}
+
+function getImageModelCatalog() {
+  return {
+    models: [...IMAGE_MODEL_IDS],
+    defaultModel: IMAGE_MODELS.has(imageModel) ? imageModel : IMAGE_MODEL_IDS[0],
+  };
 }
 
 function resolveImageProvider() {
@@ -238,6 +247,12 @@ app.use(express.static(path.join(__dirname, "build")));
 
 app.get(["/", "/generator", "/tools"], async (req, res) => {
   res.sendFile(path.join(__dirname, "build/index.html"));
+});
+
+// 前端进入页面时先拉取可用模型，避免把模型清单和默认模型写死在前端。
+app.get("/api/image-models", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json(getImageModelCatalog());
 });
 
 // 图片接口的返回格式在不同兼容服务之间不完全一致，这里统一抽成浏览器可直接展示的 URL/data URL。
@@ -663,7 +678,7 @@ function validateImageStreamRequest(request) {
 
   if (!IMAGE_MODELS.has(request.model)) {
     return {
-      message: "图片模型不支持，请选择 gpt-image-2、gpt-image-2.5-flare 或 gpt-image-2.5-sunburst",
+      message: "图片模型不支持，请选择 gpt-image-2.5-flare 或 gpt-image-2.5-sunburst",
       statusCode: 400,
       errorStage: "model",
     };
@@ -1339,6 +1354,8 @@ module.exports = {
   parseUpstreamImageError,
   getBadUpstreamImageError,
   getMaxUploadImages,
+  getImageModelCatalog,
+  IMAGE_MODEL_IDS,
   isAllowedImageSize,
   MAX_UPLOAD_IMAGES,
   MAX_UPLOAD_IMAGE_BYTES,

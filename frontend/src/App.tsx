@@ -87,6 +87,7 @@ type IdPhotoBackground = {
 };
 
 const API_ENDPOINT = "/api/generate-image-stream";
+const IMAGE_MODELS_ENDPOINT = "/api/image-models";
 const MAX_REFERENCE_IMAGES = 4;
 const MAX_REFERENCE_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_REFERENCE_TOTAL_SIZE = 40 * 1024 * 1024;
@@ -99,8 +100,6 @@ const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const PDF_MIME_TYPE = "application/pdf";
 const DEFAULT_IMAGE_SIZE = "auto";
 const IMAGE_SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024", "2048x1152", "1152x2048"];
-const DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare";
-const IMAGE_MODEL_OPTIONS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"];
 const ID_PHOTO_SPECS: IdPhotoSpec[] = [
   { id: "one-inch", label: "一寸", width: 295, height: 413, millimeters: "25 x 35 mm" },
   { id: "small-one-inch", label: "小一寸", width: 260, height: 378, millimeters: "22 x 32 mm" },
@@ -161,6 +160,27 @@ const loadPdfWriter = (() => {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseImageModelCatalog(payload: unknown): { models: string[]; defaultModel: string } {
+  if (!isRecord(payload) || !Array.isArray(payload.models)) {
+    throw new Error("可用模型列表格式不正确。");
+  }
+
+  const models = payload.models
+    .filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    .map((item) => item.trim());
+
+  if (models.length === 0) {
+    throw new Error("服务端未返回可用模型。");
+  }
+
+  const defaultModel =
+    typeof payload.defaultModel === "string" && models.includes(payload.defaultModel)
+      ? payload.defaultModel
+      : models[0];
+
+  return { models, defaultModel };
 }
 
 function formatBytes(bytes: number) {
@@ -349,7 +369,7 @@ function createImageFormData(prompt: string, size: string, model: string, images
   const formData = new FormData();
   formData.append("prompt", prompt);
   formData.append("size", size || DEFAULT_IMAGE_SIZE);
-  formData.append("model", model || DEFAULT_IMAGE_MODEL);
+  formData.append("model", model);
   images.forEach((image) => formData.append("images", image));
   return formData;
 }
@@ -879,7 +899,11 @@ export default function App() {
   const [refinementPrompt, setRefinementPrompt] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
   const [size, setSize] = useState(DEFAULT_IMAGE_SIZE);
-  const [model, setModel] = useState(DEFAULT_IMAGE_MODEL);
+  const [model, setModel] = useState("");
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [modelCatalogStatus, setModelCatalogStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [modelCatalogMessage, setModelCatalogMessage] = useState("");
+  const [modelCatalogReloadKey, setModelCatalogReloadKey] = useState(0);
   const [validationMessage, setValidationMessage] = useState("");
   const [refinementMessage, setRefinementMessage] = useState("");
   const [state, setState] = useState<GenerationState>("idle");
@@ -1004,6 +1028,41 @@ export default function App() {
   useEffect(() => {
     pdfImagesRef.current = pdfImages;
   }, [pdfImages]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let isMounted = true;
+
+    setModelCatalogStatus("loading");
+    setModelCatalogMessage("");
+
+    void fetch(IMAGE_MODELS_ENDPOINT, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`获取可用模型失败：HTTP ${response.status}`);
+        return parseImageModelCatalog(await response.json());
+      })
+      .then((catalog) => {
+        if (!isMounted) return;
+        setModelOptions(catalog.models);
+        setModel((current) => (catalog.models.includes(current) ? current : catalog.defaultModel));
+        setModelCatalogStatus("ready");
+      })
+      .catch((error) => {
+        if (!isMounted || controller.signal.aborted) return;
+        setModelOptions([]);
+        setModel("");
+        setModelCatalogStatus("error");
+        setModelCatalogMessage(error instanceof Error ? error.message : "获取可用模型失败。");
+      });
+
+    return () => {
+      isMounted = false;
+      controller.abort();
+    };
+  }, [modelCatalogReloadKey]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1204,6 +1263,10 @@ export default function App() {
     const spec = ID_PHOTO_SPECS.find((item) => item.id === idPhotoSpecId) ?? ID_PHOTO_SPECS[0];
     const background = ID_PHOTO_BACKGROUNDS.find((item) => item.id === idPhotoBackgroundId) ?? ID_PHOTO_BACKGROUNDS[0];
     if (!sourceFile || isIdPhotoProcessing) return;
+    if (!model) {
+      setIdPhotoMessage("可用模型尚未加载完成，请稍后重试。");
+      return;
+    }
 
     idPhotoAbortRef.current?.abort();
     const controller = new AbortController();
@@ -1846,6 +1909,10 @@ export default function App() {
   // 只调用流式接口；生成/编辑由是否上传参考图自动决定。
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!model) {
+      setValidationMessage("可用模型尚未加载完成，请稍后重试。");
+      return;
+    }
     const formData = createImageFormData(prompt, size, model, images.map((image) => image.file));
     await runImageRequest(formData, "正在上传 multipart/form-data 到 /api/generate-image-stream…", prompt);
   };
@@ -1863,6 +1930,11 @@ export default function App() {
 
     if (!finalImage) {
       setRefinementMessage("请先生成最终图片。");
+      return;
+    }
+
+    if (!model) {
+      setRefinementMessage("可用模型尚未加载完成，请稍后重试。");
       return;
     }
 
@@ -1886,9 +1958,19 @@ export default function App() {
   };
 
   const isGenerating = state === "generating";
-  const canSubmit = Boolean(prompt.trim()) && prompt.length <= MAX_PROMPT_LENGTH && !isGenerating;
+  const canSubmit =
+    Boolean(prompt.trim()) &&
+    prompt.length <= MAX_PROMPT_LENGTH &&
+    Boolean(model) &&
+    modelCatalogStatus === "ready" &&
+    !isGenerating;
   const visibleResult = finalImage ?? partialImage;
-  const canRefine = Boolean(finalImage && refinementPrompt.trim()) && refinementPrompt.length <= MAX_REFINEMENT_PROMPT_LENGTH && !isGenerating;
+  const canRefine =
+    Boolean(finalImage && refinementPrompt.trim()) &&
+    refinementPrompt.length <= MAX_REFINEMENT_PROMPT_LENGTH &&
+    Boolean(model) &&
+    modelCatalogStatus === "ready" &&
+    !isGenerating;
   const isToolsPage = location.pathname === "/tools";
   const adjustLightboxZoom = (amount: number) => {
     updateLightboxZoom(lightboxZoomValueRef.current + amount);
@@ -1998,14 +2080,34 @@ export default function App() {
 
             <label className="field-label size-label" htmlFor="model">
               图片模型
+              {modelCatalogStatus === "loading" && <span className="field-hint">正在获取…</span>}
             </label>
-            <select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={isGenerating}>
-              {IMAGE_MODEL_OPTIONS.map((option) => (
+            <select
+              id="model"
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+              disabled={isGenerating || modelCatalogStatus !== "ready"}
+            >
+              {modelCatalogStatus === "loading" && <option value="">正在获取可用模型…</option>}
+              {modelCatalogStatus === "error" && <option value="">可用模型获取失败</option>}
+              {modelOptions.map((option) => (
                 <option value={option} key={option}>
                   {option}
                 </option>
               ))}
             </select>
+            {modelCatalogStatus === "error" && (
+              <p className="validation-message" aria-live="polite">
+                {modelCatalogMessage}
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => setModelCatalogReloadKey((key) => key + 1)}
+                >
+                  重试
+                </button>
+              </p>
+            )}
 
             <label className="field-label size-label" htmlFor="size">
               输出尺寸

@@ -55,19 +55,30 @@ npm run frontend:build
 
 - `POST /v1/images/generations`：无参考图时文生图。
 - `POST /v1/images/edits`：有参考图或基于最终图追加修改。
-- `gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，以及 `image[]` 多文件字段。
+- `gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，以及 `image[]` 多文件字段。
 - `/v1/images/generations` 使用上游流式响应并支持阶段性预览；`/v1/images/edits` 在当前兼容服务上使用非流式上游请求，完成后仍通过浏览器端 SSE 返回最终图片，避免 `stream=true` 长时间无响应。
 
 服务端不会在 Images API 不兼容时静默回退到其他接口，以免改变生成语义。更换兼容服务后应分别验证以上两个端点。
 
 ## API
 
+`GET /api/image-models`
+
+页面加载时先调用该接口获取可用模型清单，前端不内置模型 ID 和默认模型。返回 `models`（当前服务端允许的图片模型）与 `defaultModel`（默认模型，取 `OPENAI_IMAGE_MODEL`，若不在清单内则取列表第一项）。接口失败时下拉框不可用并展示重试入口。
+
+```json
+{
+  "models": ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"],
+  "defaultModel": "gpt-image-2.5-flare"
+}
+```
+
 `POST /api/generate-image-stream`
 
 使用 `multipart/form-data` 传入：
 
 - `prompt`：必填，去除首尾空白后不能为空，最多 2000 个字符。
-- `model`：可省略，默认 `gpt-image-2.5-flare`；仅支持 `gpt-image-2`、`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`。
+- `model`：前端始终显式传入从 `/api/image-models` 获取的模型；直接调用接口时可省略，此时由服务端 `OPENAI_IMAGE_MODEL` 决定。仅支持 `/api/image-models` 返回的模型。
 - `size`：可省略，默认 `auto`；也可传已选图片模型支持的 `WIDTHxHEIGHT`。除 `auto` 外，宽高必须都是 16 的倍数，比例在 1:3～3:1，最长边不超过 3840px，总像素为 655,360～8,294,400。
 - `images`：可选的一个或多个参考图片。是否存在参考图就是服务端选择“生成”或“编辑”的唯一依据，不接受客户端 `mode`。
 

@@ -5,6 +5,7 @@
 ## 功能
 
 - 文生图与参考图编辑，支持 PNG、JPG、WebP 参考图和 SSE 流式预览
+- 独立英语图片工作台 `/english`：人物特征提取与审核、角色图、教材场景图和道具修改；默认使用文档中的场景提示词
 - 基于当前生成结果追加提示词继续修改
 - 证件照制作：上传正面人像后可选一寸、小一寸或二寸以及蓝、白、红底；通过图片编辑服务换底，再在浏览器导出标准像素 PNG
 - 最终图下载、复制，并可直接送入透明 PNG、去边框、压缩、图片转 PDF
@@ -44,6 +45,7 @@ npm run frontend:build
 | `OPENAI_API_KEY` | 图片服务 API 密钥，必填 | 无 |
 | `OPENAI_BASE_URL` | 兼容 OpenAI Images API 的服务地址 | `https://vibe.soyoung.com` |
 | `OPENAI_IMAGE_MODEL` | 客户端未传模型时使用的默认图片模型 | `gpt-image-2.5-flare` |
+| `ENGLISH_VISION_MODEL` | 英语工作台的人物特征识别模型，需支持图像输入；不影响图片模型 | `gpt-5.6` |
 | `PORT` | 服务端端口 | `80` |
 | `CORS_ORIGIN` | 允许的跨域来源，逗号分隔 | 无 |
 | `IMAGE_RATE_LIMIT_PER_HOUR` | 单 IP 每小时生成次数，`0` 关闭限流 | `20` |
@@ -60,6 +62,8 @@ npm run frontend:build
 
 服务端不会在 Images API 不兼容时静默回退到其他接口，以免改变生成语义。更换兼容服务后应分别验证以上两个端点。
 
+英语工作台使用独立接口，最多 16 张参考图、单张 20MB、总计 40MB。人物特征识别需配置可用的视觉模型；识别失败时可手动填写并审核特征。场景角色图必须填写对应关系。
+
 ## API
 
 `GET /api/image-models`
@@ -72,6 +76,8 @@ npm run frontend:build
   "defaultModel": "gpt-image-2.5-flare"
 }
 ```
+
+`POST /api/english/extract-character` 和 `POST /api/english/generate-image-stream` 分别服务于新页面的人物特征识别和图片生成；图片生成允许更长的场景提示词和最多 16 张参考图。
 
 `POST /api/generate-image-stream`
 

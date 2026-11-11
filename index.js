@@ -245,7 +245,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(express.static(path.join(__dirname, "build")));
 
-app.get(["/", "/generator", "/tools"], async (req, res) => {
+app.get(["/", "/generator", "/tools", "/english"], async (req, res) => {
   res.sendFile(path.join(__dirname, "build/index.html"));
 });
 
@@ -1287,6 +1287,13 @@ app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (r
     }
   }
 });
+
+// 英语工作台使用独立路由和上传限制，原图片生成接口保持不变。
+app.use("/api/english", require("./english-api").createEnglishRouter({
+  createImageRateLimiter, normalizeUploadedFiles, getImageStreamRequest,
+  validateImageStreamRequest, resolveImageProvider, writeSseHead,
+  startSseHeartbeat, streamImagesApi, sendSseEventIfWritable,
+}));
 
 // 小程序调用，获取微信 Open ID
 app.get("/api/wx_openid", async (req, res) => {

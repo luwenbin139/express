@@ -8,13 +8,9 @@ const cors = require("cors");
 const morgan = require("morgan");
 
 const logger = morgan("tiny");
-const DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare";
+const DEFAULT_IMAGE_MODEL = "gpt-image-2.6-flare";
 const imageModel = process.env.OPENAI_IMAGE_MODEL || DEFAULT_IMAGE_MODEL;
-// 可用模型清单是唯一数据源：既用于请求校验，也通过 /api/image-models 暴露给前端。
-const IMAGE_MODEL_IDS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"];
-const IMAGE_MODELS = new Set(IMAGE_MODEL_IDS);
 const CUSTOM_IMAGE_SIZE_PATTERN = /^(\d+)x(\d+)$/;
-const CUSTOM_IMAGE_MODELS = IMAGE_MODELS;
 const MIN_CUSTOM_IMAGE_PIXELS = 655_360;
 const MAX_CUSTOM_IMAGE_PIXELS = 8_294_400;
 const MAX_CUSTOM_IMAGE_EDGE = 3840;
@@ -45,16 +41,60 @@ function getMaxUploadImages(value) {
   return parsed;
 }
 
-function getImageModelCatalog() {
+async function getImageModelCatalog() {
+  const provider = resolveImageProvider();
+  if (!provider.apiKey) throw new Error(`服务端缺少 ${provider.missingKeyEnv} 环境变量`);
+  let response;
+  try {
+    response = await fetch(`${provider.baseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${provider.apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(12000),
+    });
+  } catch {
+    throw new Error("无法连接上游模型列表，请检查服务地址或网络");
+  }
+  if (!response.ok) throw new Error(`获取上游模型列表失败：HTTP ${response.status}`);
+  let payload;
+  try { payload = await response.json(); } catch { throw new Error("上游模型列表不是有效的 JSON"); }
+  if (!Array.isArray(payload.data)) throw new Error("上游模型列表格式不正确");
+  const models = [...new Set(payload.data.filter(item =>
+    typeof item?.id === "string" && item.id.trim() &&
+    Array.isArray(item.supported_endpoint_types) && item.supported_endpoint_types.includes("image-generation")
+  ).map(item => item.id.trim()))];
+  if (!models.length) throw new Error("上游未返回声明支持图像生成的图片模型");
   return {
-    models: [...IMAGE_MODEL_IDS],
-    defaultModel: IMAGE_MODELS.has(imageModel) ? imageModel : IMAGE_MODEL_IDS[0],
+    models,
+    defaultModel: models.includes(imageModel) ? imageModel : models[0],
+    source: "upstream",
   };
 }
 
+async function validateImageModelRequest(request) {
+  try {
+    const catalog = await getImageModelCatalog();
+    if (!request.explicitModel) request.model = catalog.defaultModel;
+    return validateImageStreamRequest({ ...request, prompt: request.prompt.slice(0, 2000) }, catalog.models);
+  } catch (error) {
+    return { message: error.message, statusCode: 502, errorStage: "model_catalog" };
+  }
+}
+
 function resolveImageProvider() {
+  const providerId = String(process.env.OPENAI_PROVIDER || "primary").trim().toLowerCase() === "backup"
+    ? "backup"
+    : "primary";
+
+  if (providerId === "backup") {
+    return {
+      id: "backup",
+      baseUrl: (process.env.OPENAI_BACKUP_BASE_URL || "https://wasai.soyoung.com").replace(/\/+$/, ""),
+      apiKey: process.env.OPENAI_BACKUP_API_KEY || "",
+      missingKeyEnv: "OPENAI_BACKUP_API_KEY",
+    };
+  }
+
   return {
-    id: "default",
+    id: "primary",
     baseUrl: (process.env.OPENAI_BASE_URL || "https://vibe.soyoung.com").replace(/\/+$/, ""),
     apiKey: process.env.OPENAI_API_KEY || "",
     missingKeyEnv: "OPENAI_API_KEY",
@@ -200,7 +240,7 @@ function isAllowedImageSize(value, model = imageModel) {
   }
 
   const match = typeof value === "string" ? value.match(CUSTOM_IMAGE_SIZE_PATTERN) : null;
-  if (!match || !CUSTOM_IMAGE_MODELS.has(model)) {
+  if (!match) {
     return false;
   }
 
@@ -250,9 +290,13 @@ app.get(["/", "/generator", "/tools", "/english"], async (req, res) => {
 });
 
 // 前端进入页面时先拉取可用模型，避免把模型清单和默认模型写死在前端。
-app.get("/api/image-models", (req, res) => {
+app.get("/api/image-models", async (req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json(getImageModelCatalog());
+  try {
+    res.json(await getImageModelCatalog());
+  } catch (error) {
+    res.status(502).json({ message: error.message });
+  }
 });
 
 // 图片接口的返回格式在不同兼容服务之间不完全一致，这里统一抽成浏览器可直接展示的 URL/data URL。
@@ -614,7 +658,7 @@ function getImageFileExtension(mimetype) {
   return "png";
 }
 
-function createImageEditFormData(prompt, size, images, model = imageModel, stream = false) {
+function createImageEditFormData(prompt, size, images, model = imageModel, stream = false, mask = null) {
   const formData = new FormData();
   formData.append("model", model);
   formData.append("prompt", prompt);
@@ -629,6 +673,7 @@ function createImageEditFormData(prompt, size, images, model = imageModel, strea
     const blob = new Blob([image.buffer], { type: image.mimetype });
     formData.append("image[]", blob, `reference-${index + 1}.${getImageFileExtension(image.mimetype)}`);
   });
+  if (mask) formData.append("mask", new Blob([mask.buffer], { type: "image/png" }), "mask.png");
 
   return formData;
 }
@@ -653,13 +698,14 @@ function getImageStreamRequest(req, referenceImages) {
     prompt: typeof body.prompt === "string" ? body.prompt.trim() : "",
     provider: resolveImageProvider(),
     model,
+    explicitModel: typeof rawModel === "string" && Boolean(rawModel.trim()),
     requestedSize: hasExplicitSize ? rawSize : "",
     size,
     totalImageBytes: referenceImages.reduce((total, image) => total + image.size, 0),
   };
 }
 
-function validateImageStreamRequest(request) {
+function validateImageStreamRequest(request, allowedModels = null) {
   if (!request.prompt) {
     return {
       message: "请输入图片提示词",
@@ -676,9 +722,9 @@ function validateImageStreamRequest(request) {
     };
   }
 
-  if (!IMAGE_MODELS.has(request.model)) {
+  if (!request.model || (allowedModels && !allowedModels.includes(request.model))) {
     return {
-      message: "图片模型不支持，请选择 gpt-image-2.5-flare 或 gpt-image-2.5-sunburst",
+      message: "图片模型不支持，请刷新模型列表并选择上游声明的图片模型",
       statusCode: 400,
       errorStage: "model",
     };
@@ -1113,7 +1159,7 @@ async function streamImagesApi(request, res, metrics) {
     let body;
 
     if (request.operation === "edit") {
-      body = createImageEditFormData(request.prompt, request.size, request.referenceImages, request.model);
+      body = createImageEditFormData(request.prompt, request.size, request.referenceImages, request.model, false, request.mask);
     } else {
       body = JSON.stringify(createImageGenerationPayload(request.prompt, request.size, request.model));
       headers["Content-Type"] = "application/json";
@@ -1243,8 +1289,8 @@ app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (r
     }
 
     const request = getImageStreamRequest(req, referenceImages);
+    const validationError = validateImageStreamRequest(request) || await validateImageModelRequest(request);
     enrichImageRequestMetrics(req, request);
-    const validationError = validateImageStreamRequest(request);
 
     if (validationError) {
       writeSseHead(res, validationError.statusCode);
@@ -1291,7 +1337,7 @@ app.post(IMAGE_STREAM_ROUTE, imageRateLimiter, parseStreamImageRequest, async (r
 // 英语工作台使用独立路由和上传限制，原图片生成接口保持不变。
 app.use("/api/english", require("./english-api").createEnglishRouter({
   createImageRateLimiter, normalizeUploadedFiles, getImageStreamRequest,
-  validateImageStreamRequest, resolveImageProvider, writeSseHead,
+  validateImageStreamRequest, validateImageModelRequest, resolveImageProvider, writeSseHead,
   startSseHeartbeat, streamImagesApi, sendSseEventIfWritable,
 }));
 
@@ -1362,7 +1408,7 @@ module.exports = {
   getBadUpstreamImageError,
   getMaxUploadImages,
   getImageModelCatalog,
-  IMAGE_MODEL_IDS,
+  validateImageModelRequest,
   isAllowedImageSize,
   MAX_UPLOAD_IMAGES,
   MAX_UPLOAD_IMAGE_BYTES,

@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test/image-upload-helpers.test.js && node --test test/english-workspace.test.js test/english-prompts.test.js",
+    "test": "node test/image-upload-helpers.test.js && node --test test/image-model-catalog.test.js test/english-workspace.test.js test/english-prompts.test.js test/english-refinement.test.js test/english-refinement-api.test.js",
     "frontend:install": "npm install --prefix frontend",
     "frontend:build": "npm run build --prefix frontend"
   },

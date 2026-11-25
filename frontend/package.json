@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "typecheck:refinement": "tsc -p tsconfig.refinement.json",
     "build": "vite build --outDir ../build --emptyOutDir"
   },
   "dependencies": {
@@ -19,5 +20,9 @@
   },
   "engines": {
     "node": ">=20.19.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.2",
+    "@types/react-dom": "^19.3.0"
   }
 }

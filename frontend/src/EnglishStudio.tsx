@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 import sceneTemplate from './english-scene-prompt.txt?raw';
-import { buildCharacterPrompt, buildPropPrompt, buildScenePrompt } from './english-prompts.mjs';
+import { buildCharacterPrompt, buildPropPrompt, buildScenePrompt, ENGLISH_REVIEW_ITEMS } from './english-prompts.mjs';
+import EnglishRefinement from './EnglishRefinement';
 import './english-studio.css';
 
 type Section = 'character' | 'scene' | 'prop';
@@ -103,7 +104,7 @@ export default function EnglishStudio() {
     if (problem) { setError(problem); return; }
     setError(''); setRoles(current => [...current, ...files.map(file => ({ id: crypto.randomUUID(), file, mapping: '' }))]);
   };
-  const setTab = (next: Section) => { setSection(next); setError(''); setResult(''); setPartial(''); setStatus('准备就绪'); setReviewPrompt(false); };
+  const setTab = (next: Section) => { setSection(next); if (next === 'scene') setSize('2048x1152'); setError(''); setResult(''); setPartial(''); setStatus('准备就绪'); setReviewPrompt(false); };
 
   const extract = async () => {
     if (!characterImage) { setError('请先上传教材人物截图。'); return; }
@@ -215,6 +216,8 @@ export default function EnglishStudio() {
       </form>
       <section className="eng-result" aria-live="polite"><div className="eng-result-heading"><div><p className="eng-eyebrow">YOUR CREATION</p><h2>创作预览</h2></div><span className="eng-status-dot">{busy ? '生成中' : result ? '已完成' : '等待生成'}</span></div><div className={`eng-canvas ${result || partial ? 'has-image' : ''}`}>{result || partial ? <img src={result || partial} alt={result ? `${name || info.title}生成结果` : '生成中的预览'} /> : <div className="eng-empty"><span className="eng-empty-art"><i />✳</span><strong>灵感，即将成形</strong><p>完成左侧配置，生成的图片将显示在这里。</p></div>}</div><div className="eng-result-bottom"><div><strong>{name || `${info.title}图片`}</strong><p>{status}</p></div>{result && <a className="eng-download" href={result} download={`${name.trim().replace(/[\\/:*?"<>|]/g, '-') || 'english-image'}.${result.startsWith('data:image/jpeg') ? 'jpg' : result.startsWith('data:image/webp') ? 'webp' : 'png'}`}>下载图片 ↓</a>}</div><div className="eng-check"><span>CHECK BEFORE EXPORT</span><p>人物外貌和动作 · 道具颜色与数量 · 背景与前后画面一致</p></div></section>
     </div>
+    <EnglishRefinement result={result} original={section === 'scene' ? sceneImage : section === 'prop' ? propImage : characterImage} references={section === 'scene' ? roles.map(role => role.file) : section === 'prop' && propReference ? [propReference] : []} model={model} disabled={Boolean(busy)} name={name} />
+    <details className="eng-delivery-checks"><summary>交付检查标准</summary><ul>{ENGLISH_REVIEW_ITEMS.map(item => <li key={item}>{item}</li>)}</ul><p>由处理者逐项对照检查；此清单不会自动判定还原度。</p></details>
     <footer className="eng-footer"><span>AI IMAGE STUDIO</span><span>MADE FOR EVERY LITTLE DETAIL ✳</span></footer>
   </main>;
 }

@@ -9,7 +9,7 @@ async function base() { if (!server.listening) await new Promise(resolve => serv
 function form(count, prompt = '测试提示词') {
   const data = new FormData();
   data.append('prompt', prompt);
-  data.append('model', 'gpt-image-2.5-flare');
+  data.append('model', 'gpt-image-2.6-flare');
   data.append('size', 'auto');
   for (let i = 0; i < count; i++) data.append('images', new Blob([png], { type: 'image/png' }), `${i}.png`);
   return data;
@@ -20,6 +20,7 @@ test('independent workbench accepts five reference images and long prompts while
   let received;
   global.fetch = async (url, options) => {
     if (String(url).startsWith('http://127.0.0.1:')) return upstreamFetch(url, options);
+    if (String(url).endsWith('/v1/models')) return new Response(JSON.stringify({ data: [{ id: 'gpt-image-2.6-flare', supported_endpoint_types: ['image-generation'] }] }), { headers: { 'content-type': 'application/json' } });
     received = options.body;
     return new Response(JSON.stringify({ data: [{ b64_json: Buffer.alloc(100, 1).toString('base64') }] }), { status: 200, headers: { 'content-type': 'application/json' } });
   };

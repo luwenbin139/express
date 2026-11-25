@@ -25,8 +25,6 @@ const {
   parseUpstreamImageError,
   getBadUpstreamImageError,
   getMaxUploadImages,
-  getImageModelCatalog,
-  IMAGE_MODEL_IDS,
   isAllowedImageSize,
   parseAllowedCorsOrigins,
   createCorsOptions,
@@ -83,7 +81,7 @@ function createSseResponse() {
   };
 }
 
-function createStreamContext(operation = "generate", model = "gpt-image-2.5-flare") {
+function createStreamContext(operation = "generate", model = "gpt-image-2.6-flare") {
   return {
     completed: false,
     failed: false,
@@ -255,18 +253,20 @@ test("isAllowedImageSize applies one rule to presets and custom sizes", () => {
 });
 
 test("getImageStreamRequest defaults an omitted size to auto and accepts an allowed model", () => {
-  const noImage = getImageStreamRequest({ body: { prompt: " draw ", mode: "edit", model: "gpt-image-2.5-flare" } }, []);
+  const omittedModel = getImageStreamRequest({ body: { prompt: "draw" } }, []);
+  const noImage = getImageStreamRequest({ body: { prompt: " draw ", mode: "edit", model: "gpt-image-2.6-flare" } }, []);
   const image = createReferenceImage();
-  const withImage = getImageStreamRequest({ body: { prompt: "edit", mode: "generate", model: "gpt-image-2.5-sunburst", size: "2048x1152" } }, [image]);
+  const withImage = getImageStreamRequest({ body: { prompt: "edit", mode: "generate", model: "gpt-image-2.6-sunburst", size: "2048x1152" } }, [image]);
 
   assert.strictEqual(noImage.size, "auto");
+  assert.strictEqual(omittedModel.model, "gpt-image-2.6-flare");
   assert.strictEqual(noImage.operation, "generate");
   assert.strictEqual(noImage.endpoint, "/v1/images/generations");
-  assert.strictEqual(noImage.model, "gpt-image-2.5-flare");
+  assert.strictEqual(noImage.model, "gpt-image-2.6-flare");
   assert.strictEqual(withImage.operation, "edit");
   assert.strictEqual(withImage.endpoint, "/v1/images/edits");
   assert.strictEqual(withImage.size, "2048x1152");
-  assert.strictEqual(withImage.model, "gpt-image-2.5-sunburst");
+  assert.strictEqual(withImage.model, "gpt-image-2.6-sunburst");
   assert.strictEqual(withImage.totalImageBytes, image.size);
   assert.strictEqual(Object.hasOwn(noImage, "mode"), false);
 });
@@ -285,7 +285,7 @@ test("explicit invalid sizes produce a validation error instead of falling back"
 test("unsupported image models are rejected before calling the upstream API", () => {
   const request = getImageStreamRequest({ body: { prompt: "draw", model: "gpt-image-other" } }, []);
   request.provider.apiKey = "key";
-  const error = validateImageStreamRequest(request);
+  const error = validateImageStreamRequest(request, ["gpt-image-2.6-flare"]);
 
   assert.strictEqual(error.statusCode, 400);
   assert.strictEqual(error.errorStage, "model");
@@ -298,7 +298,7 @@ test("image request validation checks prompt, size, and server configuration", (
     operation: "generate",
     endpoint: "/v1/images/generations",
     prompt: "draw",
-    model: "gpt-image-2.5-flare",
+    model: "gpt-image-2.6-flare",
     provider: { apiKey: "key", missingKeyEnv: "OPENAI_API_KEY" },
     requestedSize: "",
     size: "auto",
@@ -312,10 +312,10 @@ test("image request validation checks prompt, size, and server configuration", (
 });
 
 test("generation payload targets the selected image model directly with streaming", () => {
-  const payload = createImageGenerationPayload("draw", "1024x1024", "gpt-image-2.5-sunburst");
+  const payload = createImageGenerationPayload("draw", "1024x1024", "gpt-image-2.6-sunburst");
 
   assert.deepStrictEqual(payload, {
-    model: "gpt-image-2.5-sunburst",
+    model: "gpt-image-2.6-sunburst",
     prompt: "draw",
     size: "1024x1024",
     stream: true,
@@ -328,11 +328,11 @@ test("generation payload targets the selected image model directly with streamin
 test("edit form uses repeated image[] files without upstream streaming", () => {
   const first = createReferenceImage(8, "image/png");
   const second = createReferenceImage(12, "image/webp");
-  const form = createImageEditFormData("edit", "1024x1024", [first, second], "gpt-image-2.5-sunburst");
+  const form = createImageEditFormData("edit", "1024x1024", [first, second], "gpt-image-2.6-sunburst");
   const entries = [...form.entries()];
   const imageEntries = entries.filter(([key]) => key === "image[]");
 
-  assert.strictEqual(form.get("model"), "gpt-image-2.5-sunburst");
+  assert.strictEqual(form.get("model"), "gpt-image-2.6-sunburst");
   assert.strictEqual(form.get("prompt"), "edit");
   assert.strictEqual(form.get("size"), "1024x1024");
   assert.strictEqual(form.get("stream"), "false");
@@ -422,7 +422,7 @@ test("image request metrics contain only the approved non-sensitive fields", () 
     totalImageBytes: 1234,
     size: "1024x1024",
     endpoint: "/v1/images/edits",
-    model: "gpt-image-2.5-flare",
+    model: "gpt-image-2.6-flare",
     upstreamConnectedAt: 1100,
     firstImageAt: 1200,
     completedAt: 1300,
@@ -607,23 +607,82 @@ test("createImageRateLimiter returns SSE 429 for limited stream requests", () =>
 });
 
 test("resolveImageProvider always uses the configured OpenAI-compatible provider", () => {
+  const originalProvider = process.env.OPENAI_PROVIDER;
   const originalKey = process.env.OPENAI_API_KEY;
   const originalBaseUrl = process.env.OPENAI_BASE_URL;
+  // .env may select the backup provider; pin this case to primary explicitly.
+  process.env.OPENAI_PROVIDER = "primary";
   process.env.OPENAI_API_KEY = "default-key";
   process.env.OPENAI_BASE_URL = "https://default.example.com/";
 
   try {
     assert.deepStrictEqual(resolveImageProvider(), {
-      id: "default",
+      id: "primary",
       baseUrl: "https://default.example.com",
       apiKey: "default-key",
       missingKeyEnv: "OPENAI_API_KEY",
     });
   } finally {
+    if (originalProvider === undefined) delete process.env.OPENAI_PROVIDER;
+    else process.env.OPENAI_PROVIDER = originalProvider;
     if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = originalKey;
     if (originalBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
     else process.env.OPENAI_BASE_URL = originalBaseUrl;
+  }
+});
+
+test("resolveImageProvider selects the configured backup provider", () => {
+  const original = {
+    OPENAI_PROVIDER: process.env.OPENAI_PROVIDER,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_BACKUP_API_KEY: process.env.OPENAI_BACKUP_API_KEY,
+    OPENAI_BACKUP_BASE_URL: process.env.OPENAI_BACKUP_BASE_URL,
+  };
+  process.env.OPENAI_PROVIDER = "backup";
+  process.env.OPENAI_API_KEY = "primary-key";
+  process.env.OPENAI_BASE_URL = "https://primary.example.com/";
+  process.env.OPENAI_BACKUP_API_KEY = "backup-key";
+  process.env.OPENAI_BACKUP_BASE_URL = "https://wasai.soyoung.com/";
+
+  try {
+    assert.deepStrictEqual(resolveImageProvider(), {
+      id: "backup",
+      baseUrl: "https://wasai.soyoung.com",
+      apiKey: "backup-key",
+      missingKeyEnv: "OPENAI_BACKUP_API_KEY",
+    });
+  } finally {
+    for (const [name, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test("resolveImageProvider uses the documented backup URL and key error when backup URL is omitted", () => {
+  const original = {
+    OPENAI_PROVIDER: process.env.OPENAI_PROVIDER,
+    OPENAI_BACKUP_API_KEY: process.env.OPENAI_BACKUP_API_KEY,
+    OPENAI_BACKUP_BASE_URL: process.env.OPENAI_BACKUP_BASE_URL,
+  };
+  process.env.OPENAI_PROVIDER = "backup";
+  process.env.OPENAI_BACKUP_API_KEY = "";
+  delete process.env.OPENAI_BACKUP_BASE_URL;
+
+  try {
+    assert.deepStrictEqual(resolveImageProvider(), {
+      id: "backup",
+      baseUrl: "https://wasai.soyoung.com",
+      apiKey: "",
+      missingKeyEnv: "OPENAI_BACKUP_API_KEY",
+    });
+  } finally {
+    for (const [name, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 
@@ -648,25 +707,6 @@ test("frontend uses direct automatic operation selection and matching limits", (
   assert.match(appSource, /generationError\.detail/);
   assert.match(appSource, /请求 ID：\{generationError\.requestId\}/);
   assert.match(appSource, /createImageFormData\(refinementRequest, size, model, \[generatedImageFile\]\)/);
-});
-
-test("image model catalog is exposed by the backend and fetched on page load", () => {
-  const catalog = getImageModelCatalog();
-
-  assert.deepStrictEqual(catalog.models, IMAGE_MODEL_IDS);
-  assert.notStrictEqual(catalog.models, IMAGE_MODEL_IDS);
-  assert.ok(catalog.models.length > 0);
-  assert.ok(catalog.models.every((id) => typeof id === "string" && id.trim().length > 0));
-  assert.ok(catalog.models.includes(catalog.defaultModel));
-
-  const serverSource = fs.readFileSync(path.join(__dirname, "../index.js"), "utf8");
-  const appSource = fs.readFileSync(path.join(__dirname, "../frontend/src/App.tsx"), "utf8");
-
-  assert.match(serverSource, /app\.get\("\/api\/image-models"/);
-  assert.match(serverSource, /res\.json\(getImageModelCatalog\(\)\)/);
-  assert.match(appSource, /useState<"loading" \| "ready" \| "error">\("loading"\)/);
-  assert.match(appSource, /modelCatalogStatus === "ready"/);
-  assert.match(appSource, /setModelCatalogReloadKey\(\(key\) => key \+ 1\)/);
 });
 
 test("runtime and docs no longer route image requests through Responses API", () => {

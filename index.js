@@ -57,11 +57,19 @@ async function getImageModelCatalog() {
   let payload;
   try { payload = await response.json(); } catch { throw new Error("上游模型列表不是有效的 JSON"); }
   if (!Array.isArray(payload.data)) throw new Error("上游模型列表格式不正确");
-  const models = [...new Set(payload.data.filter(item =>
-    typeof item?.id === "string" && item.id.trim() &&
-    Array.isArray(item.supported_endpoint_types) && item.supported_endpoint_types.includes("image-generation")
-  ).map(item => item.id.trim()))];
-  if (!models.length) throw new Error("上游未返回声明支持图像生成的图片模型");
+  const items = payload.data.filter(item => typeof item?.id === "string" && item.id.trim());
+  const declaresCapability = items.some(item => Array.isArray(item.supported_endpoint_types));
+  // Gateways that declare endpoint types are authoritative: a model is an image model
+  // only when it says so. Gateways that omit the field entirely (vibe) leave the
+  // model name as the only signal, so fall back to the known image model families.
+  const IMAGE_MODEL_ID = /^(gpt-image-\d|dall-e-|gpt-image-\d|qwen-image|wan\d[\d.]*-image|flux|stable-diffusion|sd-|imagen|seedream|kolors|hidream|midjourney)/i;
+  const isImageModel = declaresCapability
+    ? item => Array.isArray(item.supported_endpoint_types) && item.supported_endpoint_types.includes("image-generation")
+    : item => IMAGE_MODEL_ID.test(item.id.trim());
+  const models = [...new Set(items.filter(isImageModel).map(item => item.id.trim()))];
+  if (!models.length) throw new Error(declaresCapability
+    ? "上游未返回声明支持图像生成的图片模型"
+    : "上游模型列表中未找到可识别的图片模型");
   return {
     models,
     defaultModel: models.includes(imageModel) ? imageModel : models[0],

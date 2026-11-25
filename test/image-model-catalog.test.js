@@ -52,6 +52,38 @@ test('catalog reports missing image capability rather than guessing from model n
     assert.match((await response.json()).message, /图片模型/);
   } finally { global.fetch = realFetch; }
 });
+test('catalog falls back to known image model families when the gateway omits capability fields', async () => {
+  // vibe.soyoung.com returns {id, object, created, owned_by, type, display_name} only.
+  global.fetch = async () => modelsResponse([
+    { id: 'gpt-6.1-terra' },
+    { id: 'gpt-image-2.6-flare' },
+    { id: 'gpt-image-2.6-sunburst' },
+    { id: 'qwen-image-3.0-pro' },
+    { id: 'wan2.7-image' },
+    { id: 'wan2.7-image-pro' },
+    { id: 'wan3.0-video' },
+  ]);
+  try {
+    const response = await realFetch(`${await base()}/api/image-models`);
+    assert.equal(response.status, 200);
+    const catalog = await response.json();
+    assert.deepEqual(catalog.models, ['gpt-image-2.6-flare', 'gpt-image-2.6-sunburst', 'qwen-image-3.0-pro', 'wan2.7-image', 'wan2.7-image-pro']);
+    assert.equal(catalog.defaultModel, 'gpt-image-2.6-flare');
+  } finally { global.fetch = realFetch; }
+});
+test('catalog with mixed capability declarations still trusts the declared field', async () => {
+  // One item declaring types makes the declaration authoritative for the whole list.
+  global.fetch = async () => modelsResponse([
+    { id: 'gpt-image-2.6-flare', supported_endpoint_types: ['openai-response'] },
+    { id: 'gpt-6.1-sol' },
+    { id: 'wan2.7-image', supported_endpoint_types: ['image-generation'] },
+  ]);
+  try {
+    const response = await realFetch(`${await base()}/api/image-models`);
+    const catalog = await response.json();
+    assert.deepEqual(response.status === 200 ? catalog.models : catalog.message, ['wan2.7-image']);
+  } finally { global.fetch = realFetch; }
+});
 test('catalog fails explicitly when the upstream payload is malformed', async () => {
   for (const body of ['not-json', JSON.stringify({ object: 'list' })]) {
     global.fetch = async () => new Response(body, { headers: { 'content-type': 'application/json' } });
